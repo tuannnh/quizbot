@@ -94,6 +94,25 @@ Restart the agent only when `agent.py` itself changes (after a `git pull`):
 - Windows: re-run `install_windows.ps1` (it restarts the background process)
 - macOS: `launchctl kickstart -k gui/$(id -u)/me.quizbot.agent`
 
+### Coding problems (LeetCode, HackerRank, …)
+
+Press the hotkey over the problem page with the editor visible. The answer is typed `coding`
+and contains:
+- the **language** read from the editor's language picker (Python 3 if none is visible)
+- the **code**, which keeps the stub's exact function signature. If the editor already has I/O
+  boilerplate, only the function to complete is returned; if the editor is empty, a full program
+- a one-line **approach** and the **time/space complexity**
+
+The agent puts the code on the **clipboard** (`QUIZBOT_COPY_CODE=1`, the default), so you can paste
+it into the editor straight away. The dashboard shows it with a **Copy** button, which also works
+over plain-HTTP LAN addresses.
+
+Tips:
+- Capture with the full statement and the stub both on screen. If the statement is cut off, the
+  answer covers what's visible and reports lower confidence.
+- For coding sessions, pick a stronger model on the dashboard (e.g. Sonnet). The second-opinion
+  check skips coding answers, because two different solutions can both be correct.
+
 ### Second opinion (fast model first, stronger model when unsure)
 
 **Settings → Double-check with** picks a second model, for example `claude-sonnet-5-5`, and

@@ -102,6 +102,8 @@ def _display_line(r: dict) -> str:
         return "No question found on screen"
     if r["status"] == "error":
         return f"Error: {r.get('error')}"
+    if r.get("question_type") == "coding":
+        return f"{r.get('language') or 'Code'} solution ready — {r.get('answer') or ''} ({r.get('complexity') or ''})".strip()
     keys_list = r.get("answer_keys") or []
     keys = ", ".join(keys_list)
     conf = f"{round((r.get('confidence') or 0) * 100)}%"
@@ -126,6 +128,9 @@ def _answer_fields(result: dict) -> dict:
         confidence=result.get("confidence"),
         reasoning=result.get("reasoning"),
         model=result.get("model"),
+        language=result.get("language"),
+        code=result.get("code"),
+        complexity=result.get("complexity"),
     )
 
 
@@ -143,6 +148,8 @@ def _needs_escalation(result: dict) -> tuple[str, float] | None:
     model, below = _escalation_settings()
     if not model or model == result.get("model") or not result.get("found_question"):
         return None
+    if result.get("question_type") == "coding":
+        return None  # two code solutions can't be compared for agreement; pick the model per session instead
     if (result.get("confidence") or 0) >= below:
         return None
     return model, below

@@ -11,6 +11,7 @@ The file is re-read on every capture, so edits apply immediately, without a rest
     QUIZBOT_MODEL    model for this machine; empty = the model set on the dashboard
     QUIZBOT_MACHINE  label for this computer (default: hostname)
     QUIZBOT_NOTIFY   1 = show a desktop notification with the answer (default 1)
+    QUIZBOT_COPY_CODE 1 = put the solution on the clipboard for coding problems (default 1)
     QUIZBOT_HOTKEY   modifiers + `, e.g. ctrl+` (default), alt+`, ctrl+shift+`  (restart to apply)
 """
 from __future__ import annotations
@@ -81,6 +82,7 @@ class Config:
     model: str     # "" = let the server pick (dashboard setting, else server default)
     machine: str
     notify: bool
+    copy_code: bool
     hotkey: str    # read at startup only; restart the agent after changing it
 
 
@@ -98,6 +100,7 @@ def load_config() -> Config:
         model=get("QUIZBOT_MODEL").strip(),
         machine=get("QUIZBOT_MACHINE").strip() or socket.gethostname(),
         notify=get("QUIZBOT_NOTIFY", "1") == "1",
+        copy_code=get("QUIZBOT_COPY_CODE", "1") == "1",
         hotkey=get("QUIZBOT_HOTKEY", "ctrl+`").strip(),
     )
 
@@ -241,6 +244,16 @@ def notify(cfg: Config, title: str, message: str) -> None:
         log.debug("notify failed", exc_info=True)
 
 
+def copy_to_clipboard(text: str) -> bool:
+    try:
+        import pyperclip
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        log.warning("could not copy code to the clipboard", exc_info=True)
+        return False
+
+
 def _headers(cfg: Config) -> dict:
     return {"X-QuizBot-Token": cfg.token} if cfg.token else {}
 
@@ -284,7 +297,10 @@ def on_trigger() -> None:
         sent = time.perf_counter()
         result = send(cfg, image, capture_ms)
         roundtrip_ms = int((time.perf_counter() - sent) * 1000)
-        notify(cfg, "QuizBot", result.get("display", "done"))  # show the answer before any bookkeeping
+        display = result.get("display", "done")
+        if result.get("code") and cfg.copy_code and copy_to_clipboard(result["code"]):
+            display = f"Code copied to clipboard. {display}"
+        notify(cfg, "QuizBot", display)  # show the answer before any bookkeeping
         t = result.get("timings") or {}
         log.info("answer #%s [%s, %s]: %s | total %dms = capture %d + network %d + server %d (prepare %s, model %s)",
                  result.get("id"), result.get("session"), result.get("model"), result.get("display"),

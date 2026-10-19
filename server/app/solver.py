@@ -30,7 +30,8 @@ SHAPE_ALIASES = {
     "yellow circle": "circle", "green square": "square",
 }
 
-SYSTEM_PROMPT = """You are QuizBot. You receive a screenshot of a window that contains a quiz question.
+SYSTEM_PROMPT = """You are QuizBot. You receive a screenshot of a window that contains a quiz question
+or a programming problem.
 
 Your job:
 1. Find the question that is currently being asked. Ignore chrome, ads, timers, scoreboards and unrelated text.
@@ -39,6 +40,8 @@ Your job:
    - kahoot: coloured tiles with shapes (red triangle, blue diamond, yellow circle, green square)
    - true_false: exactly two options meaning true/false or yes/no
    - open: no options shown; a free-text answer is expected
+   - coding: a programming problem (LeetCode, HackerRank, Codility, an online judge or a code editor
+     with a problem statement)
    - other: anything else (ordering, matching, fill-in-the-blank, maths working ...)
 3. Transcribe the question and every option exactly as shown.
 4. Answer it. Think carefully but be fast: the user is under time pressure.
@@ -46,6 +49,7 @@ Your job:
      (e.g. "B" or "2").
    - If several options are correct ("select all that apply"), return all of their keys.
    - For open questions, give a concise, correct answer the user could type directly.
+   - For coding problems, see the coding rules below.
 5. Give an honest confidence between 0 and 1.
 
 Output rules (the app renders shapes and colours itself, so you only output plain text):
@@ -59,6 +63,20 @@ Output rules (the app renders shapes and colours itself, so you only output plai
 - `answer` is the text of the correct option; if several are correct, join their texts with " | "
   in on-screen order.
 
+Coding rules (question_type = coding):
+- `question`: the problem title, then a one-line summary of what to compute.
+- `language`: the language selected in the editor's language picker (e.g. "Python 3", "Java 15",
+  "C++20"); if none is visible, use "Python 3".
+- `code`: a complete, correct, efficient solution that can be pasted into the editor as-is. Keep the
+  exact function/class/method name, parameters and return type from the editor's stub. If the stub
+  already contains I/O boilerplate (reading stdin, writing output, `if __name__ == '__main__'`), return
+  only the function the user must complete, not the boilerplate. If the editor is empty, return a full
+  program that reads input and prints output in the stated format. Respect the constraints (large
+  numbers, time limits). Plain code only: no markdown fences, no explanations outside comments.
+- `answer`: the approach in one sentence. `complexity`: time and space, e.g. "O(n) time, O(1) space".
+- Leave `options` and `answer_keys` empty. If part of the statement is cut off, solve what is visible
+  and lower your confidence.
+
 If no question is visible, set found_question to false and leave the rest minimal."""
 
 ANSWER_TOOL = {
@@ -70,7 +88,7 @@ ANSWER_TOOL = {
             "found_question": {"type": "boolean"},
             "question_type": {
                 "type": "string",
-                "enum": ["multiple_choice", "kahoot", "true_false", "open", "other"],
+                "enum": ["multiple_choice", "kahoot", "true_false", "open", "coding", "other"],
             },
             "question": {"type": "string", "description": "Question text as shown."},
             "options": {
@@ -105,6 +123,9 @@ ANSWER_TOOL = {
                 "type": "string",
                 "description": "The answer as text (option text for choice questions, full answer for open ones).",
             },
+            "language": {"type": "string", "description": "Coding only: language of `code`."},
+            "code": {"type": "string", "description": "Coding only: the complete solution, plain code."},
+            "complexity": {"type": "string", "description": "Coding only: time and space complexity."},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         },
         "required": ["found_question", "question_type", "question", "options", "reasoning",
@@ -117,6 +138,13 @@ def _shape_of(value: str | None) -> str | None:
     return SHAPE_ALIASES.get((value or "").strip().lower())
 
 
+def _strip_fences(code: str) -> str:
+    """Remove ``` fences a model may wrap code in, keeping the code itself untouched."""
+    text = str(code).strip("\n")
+    m = re.match(r"^\s*```[\w+#.-]*\s*\n(.*?)\n?\s*```\s*$", text, re.DOTALL)
+    return m.group(1) if m else text
+
+
 def _normalise(result: dict) -> dict:
     """Fill defaults and make Kahoot answers consistent: every tile's key is its shape name.
 
@@ -126,6 +154,12 @@ def _normalise(result: dict) -> dict:
     result.setdefault("options", [])
     result.setdefault("answer_keys", [])
     result.setdefault("reasoning", "")
+    if result.get("code"):
+        result["code"] = _strip_fences(result["code"])
+        result["question_type"] = "coding"
+    if result.get("question_type") != "coding":
+        for key in ("language", "code", "complexity"):
+            result.pop(key, None)
 
     renamed: dict[str, str] = {}
     for opt in result["options"]:
@@ -266,6 +300,17 @@ class FakeSolver:
         model = model or "fake"
         delay = 0.15 if "haiku" in model else 0.4  # lets the dashboard show a visible difference
         time.sleep(delay + random.random() * 0.1)
+        if os.getenv("QUIZBOT_FAKE_MODE") == "coding":
+            return _normalise({
+                "found_question": True, "question_type": "coding",
+                "question": "A Very Big Sum — return the sum of an array of large integers.",
+                "reasoning": "Python ints are arbitrary precision, so a plain sum cannot overflow.",
+                "language": "Python 3",
+                "code": "```python\ndef aVeryBigSum(ar):\n    return sum(ar)\n```",
+                "answer": "Sum the array; Python integers don't overflow.", "complexity": "O(n) time, O(1) space",
+                "confidence": 0.97, "model": model, "model_ms": int(delay * 1000),
+                "input_tokens": len(image) // 750, "output_tokens": 90,
+            })
         if os.getenv("QUIZBOT_FAKE_MODE") == "multi" or random.random() < 0.3:
             # Multi-select with messy model output: capitalised keys and shape words in the text.
             return _normalise({

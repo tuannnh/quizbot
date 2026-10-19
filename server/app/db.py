@@ -45,6 +45,9 @@ MIGRATIONS = {
     # JSON: second-opinion check {model, status: pending|agreed|changed|error, threshold,
     #       first: {model, answer_keys, answer, confidence}, confidence, model_ms, error}
     "escalation": "TEXT",
+    "language": "TEXT",         # coding questions: language of `code`
+    "code": "TEXT",             # coding questions: the solution
+    "complexity": "TEXT",       # coding questions: time/space complexity
 }
 
 JSON_COLS = ("options", "answer_keys", "timings", "escalation")

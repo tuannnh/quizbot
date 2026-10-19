@@ -249,3 +249,30 @@ def test_schema_asks_for_reasoning_before_answer():
     order = list(ANSWER_TOOL["input_schema"]["properties"])
     assert order.index("reasoning") < order.index("answer_keys") < order.index("answer")
     assert "reasoning" in ANSWER_TOOL["input_schema"]["required"]
+
+
+# ---------------------------------------------------------------- coding problems
+def test_coding_answer_is_stored_and_fences_stripped(monkeypatch, client):
+    import app.main as m
+    from app.solver import FakeSolver
+    monkeypatch.setattr(m, "solver", FakeSolver())
+    monkeypatch.setenv("QUIZBOT_FAKE_MODE", "coding")
+    body = _capture(client).json()
+    assert body["question_type"] == "coding" and body["language"] == "Python 3"
+    assert body["code"] == "def aVeryBigSum(ar):\n    return sum(ar)"
+    assert body["complexity"].startswith("O(n)")
+    assert body["display"].startswith("Python 3 solution ready")
+    assert body["escalation"] is None
+
+
+def test_fence_variants():
+    from app.solver import _strip_fences
+    assert _strip_fences("```cpp\nint f(){}\n```") == "int f(){}"
+    assert _strip_fences("```\nx = 1\n```\n") == "x = 1"
+    assert _strip_fences("def f():\n    return 1") == "def f():\n    return 1"
+
+
+def test_code_fields_dropped_for_non_coding():
+    from app.solver import _normalise
+    r = _normalise({"question_type": "open", "answer": "42", "language": "Python 3", "complexity": "O(1)"})
+    assert "language" not in r and "complexity" not in r

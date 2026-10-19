@@ -276,3 +276,73 @@ def test_code_fields_dropped_for_non_coding():
     from app.solver import _normalise
     r = _normalise({"question_type": "open", "answer": "42", "language": "Python 3", "complexity": "O(1)"})
     assert "language" not in r and "complexity" not in r
+
+
+# ---------------------------------------------------------------- multi-screenshot coding problems
+class _CodingStub:
+    def __init__(self, same=True, qtype="coding"):
+        self.same, self.qtype, self.contexts = same, qtype, []
+        self.model = "claude-sonnet-5-5"
+
+    def solve(self, image, media_type, model=None, context=None):
+        self.contexts.append(len(context or []))
+        r = {"found_question": True, "question_type": self.qtype, "question": "Two Sum", "reasoning": "",
+             "answer": "hash map", "confidence": 0.9, "model": model or self.model, "model_ms": 5,
+             "same_problem": bool(context) and self.same, "options": [], "answer_keys": []}
+        if self.qtype == "coding":
+            r.update(language="Python 3", code=f"def twoSum(): pass  # pages={len(context or []) + 1}",
+                     complexity="O(n)")
+        return r
+
+
+def _coding_client(monkeypatch, client, **kw):
+    import app.main as m
+    stub = _CodingStub(**kw)
+    monkeypatch.setattr(m, "solver", stub)
+    client.put("/api/settings", json={"escalate_model": ""}, headers=AUTH)
+    client.delete("/api/answers", headers=AUTH)
+    return stub
+
+
+def _cap(client, machine="ci"):
+    return client.post("/api/capture", files={"image": ("c.png", _png(400, 300), "image/png")},
+                       data={"machine": machine, "session": "code"}, headers=AUTH).json()
+
+
+def test_coding_pages_are_combined(monkeypatch, client):
+    stub = _coding_client(monkeypatch, client)
+    p1, p2 = _cap(client), _cap(client)
+    assert stub.contexts == [0, 1]
+    assert p2["pages"] == [p1["id"], p2["id"]] and "pages=2" in p2["code"]
+    assert "[from 2 screenshots]" in p2["display"]
+    ids = [r["id"] for r in client.get("/api/answers?session=code").json()]
+    assert ids == [p2["id"]]                     # the partial first answer is hidden
+    assert client.get(f"/api/answers/{p1['id']}/image").status_code == 200  # its screenshot is kept
+    p3 = _cap(client)
+    assert stub.contexts == [0, 1, 2] and p3["pages"] == [p1["id"], p2["id"], p3["id"]]
+
+
+def test_other_machine_or_new_problem_not_combined(monkeypatch, client):
+    stub = _coding_client(monkeypatch, client, same=False)
+    p1 = _cap(client)
+    other = _cap(client, machine="other")
+    assert other["pages"] == [other["id"]]
+    p3 = _cap(client)                            # same machine, model says different question
+    assert stub.contexts == [0, 0, 1] and p3["pages"] == [p3["id"]]
+    assert len(client.get("/api/answers?session=code").json()) == 3
+
+
+def test_page_limit_and_clear(monkeypatch, client):
+    import app.main as m
+    stub = _coding_client(monkeypatch, client)
+    monkeypatch.setattr(m, "CODING_MAX_PAGES", 3)
+    caps = [_cap(client) for _ in range(4)]
+    assert stub.contexts == [0, 1, 2, 2]         # never more than max-1 earlier pages
+    assert caps[-1]["pages"] == [caps[1]["id"], caps[2]["id"], caps[3]["id"]]
+    assert client.delete("/api/answers?session=code", headers=AUTH).json()["deleted"] == 4
+
+
+def test_non_coding_answer_does_not_open_a_problem(monkeypatch, client):
+    stub = _coding_client(monkeypatch, client, qtype="open")
+    _cap(client), _cap(client)
+    assert stub.contexts == [0, 0]

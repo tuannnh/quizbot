@@ -41,7 +41,7 @@ Your job:
    - true_false: exactly two options meaning true/false or yes/no
    - open: no options shown; a free-text answer is expected
    - coding: a programming problem (LeetCode, HackerRank, Codility, an online judge or a code editor
-     with a problem statement)
+     with a problem statement). A problem statement alone, without an editor, is still coding.
    - other: anything else (ordering, matching, fill-in-the-blank, maths working ...)
 3. Transcribe the question and every option exactly as shown.
 4. Answer it. Think carefully but be fast: the user is under time pressure.
@@ -86,6 +86,11 @@ ANSWER_TOOL = {
         "type": "object",
         "properties": {
             "found_question": {"type": "boolean"},
+            "same_problem": {
+                "type": "boolean",
+                "description": "Only when earlier screenshots are provided: true if the newest screenshot "
+                               "continues the same problem, false if it is a different question.",
+            },
             "question_type": {
                 "type": "string",
                 "enum": ["multiple_choice", "kahoot", "true_false", "open", "coding", "other"],
@@ -217,6 +222,35 @@ def _answer_from_text(text: str) -> dict | None:
     return data if isinstance(data, dict) and "answer" in data else None
 
 
+def _image_block(data: bytes, media_type: str) -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                        "data": base64.standard_b64encode(data).decode()}}
+
+
+def build_content(image: bytes, media_type: str, context: list[bytes] | None = None) -> list[dict]:
+    """User message: earlier pages of an open coding problem (if any), then the newest screenshot."""
+    if not context:
+        return [_image_block(image, media_type),
+                {"type": "text", "text": "Read and answer the question in this screenshot."}]
+    content: list[dict] = [{"type": "text", "text": (
+        f"The user is working on a programming problem and captured it in parts. Here are the "
+        f"{len(context)} earlier screenshot(s), oldest first:")}]
+    for i, page in enumerate(context, 1):
+        content += [{"type": "text", "text": f"Earlier screenshot {i}:"}, _image_block(page, "image/jpeg")]
+    content += [
+        {"type": "text", "text": "Newest screenshot:"},
+        _image_block(image, media_type),
+        {"type": "text", "text": (
+            "Decide whether the newest screenshot shows the SAME problem as the earlier ones (for example "
+            "the statement scrolled further, examples, constraints, or the code editor and its stub).\n"
+            "- Same problem: set same_problem=true and answer using ALL screenshots together: the full "
+            "statement, every constraint and the editor's language and stub.\n"
+            "- Different question: set same_problem=false and answer only from the newest screenshot, "
+            "ignoring the earlier ones.")},
+    ]
+    return content
+
+
 class ClaudeSolver:
     def __init__(self) -> None:
         import anthropic  # imported lazily so the fake solver works without it
@@ -232,44 +266,31 @@ class ClaudeSolver:
         # Models found to reject a forced tool call; they get tool_choice "auto" from then on.
         self._no_forced_tool: set[str] = set()
 
-    def _create(self, model: str, image: bytes, media_type: str, forced: bool):
+    def _create(self, model: str, image: bytes, media_type: str, forced: bool,
+                context: list[bytes] | None = None):
         return self.client.messages.create(
             model=model,
             max_tokens=self.max_tokens,
             system=SYSTEM_PROMPT if forced else SYSTEM_PROMPT + AUTO_TOOL_NOTE,
             tools=[ANSWER_TOOL],
             tool_choice={"type": "tool", "name": "submit_answer"} if forced else {"type": "auto"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64.standard_b64encode(image).decode(),
-                            },
-                        },
-                        {"type": "text", "text": "Read and answer the question in this screenshot."},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": build_content(image, media_type, context)}],
         )
 
-    def solve(self, image: bytes, media_type: str, model: str | None = None) -> dict:
+    def solve(self, image: bytes, media_type: str, model: str | None = None,
+              context: list[bytes] | None = None) -> dict:
         model = model or self.model
         started = time.perf_counter()
         forced = model not in self._no_forced_tool
         try:
-            resp = self._create(model, image, media_type, forced)
+            resp = self._create(model, image, media_type, forced, context)
         except Exception as exc:
             if not (forced and _is_tool_choice_rejection(exc)):
                 raise
             self._no_forced_tool.add(model)
             log.info("%s rejects forced tool_choice; using auto from now on", model)
             started = time.perf_counter()  # time the call that actually answered
-            resp = self._create(model, image, media_type, forced=False)
+            resp = self._create(model, image, media_type, forced=False, context=context)
         model_ms = int((time.perf_counter() - started) * 1000)
 
         result = None
@@ -286,6 +307,8 @@ class ClaudeSolver:
         result.setdefault("question_type", "other")
         result.setdefault("question", "")
         result.setdefault("confidence", 0.5)
+        if not context:
+            result["same_problem"] = False
         result["model"] = model
         result["model_ms"] = model_ms
         result["input_tokens"] = resp.usage.input_tokens
@@ -296,14 +319,18 @@ class ClaudeSolver:
 class FakeSolver:
     """Offline solver for testing the pipeline without an API key."""
 
-    def solve(self, image: bytes, media_type: str, model: str | None = None) -> dict:
+    def solve(self, image: bytes, media_type: str, model: str | None = None,
+              context: list[bytes] | None = None) -> dict:
         model = model or "fake"
         delay = 0.15 if "haiku" in model else 0.4  # lets the dashboard show a visible difference
         time.sleep(delay + random.random() * 0.1)
         if os.getenv("QUIZBOT_FAKE_MODE") == "coding":
+            pages = len(context or []) + 1
             return _normalise({
+                "same_problem": bool(context),
                 "found_question": True, "question_type": "coding",
-                "question": "A Very Big Sum — return the sum of an array of large integers.",
+                "question": "A Very Big Sum — return the sum of an array of large integers."
+                            + (f" (from {pages} screenshots)" if pages > 1 else ""),
                 "reasoning": "Python ints are arbitrary precision, so a plain sum cannot overflow.",
                 "language": "Python 3",
                 "code": "```python\ndef aVeryBigSum(ar):\n    return sum(ar)\n```",

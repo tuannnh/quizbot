@@ -48,10 +48,12 @@ MIGRATIONS = {
     "language": "TEXT",         # coding questions: language of `code`
     "code": "TEXT",             # coding questions: the solution
     "complexity": "TEXT",       # coding questions: time/space complexity
+    "pages": "TEXT",            # JSON list of answer ids whose screenshots were combined (oldest first, incl. self)
+    "superseded_by": "INTEGER", # set when a later capture combined this page into a fuller answer
 }
 
-JSON_COLS = ("options", "answer_keys", "timings", "escalation")
-JSON_EMPTY = {"options": [], "answer_keys": [], "timings": {}, "escalation": None}
+JSON_COLS = ("options", "answer_keys", "timings", "escalation", "pages")
+JSON_EMPTY = {"options": [], "answer_keys": [], "timings": {}, "escalation": None, "pages": []}
 
 
 class Store:
@@ -96,7 +98,7 @@ class Store:
         return row["image_path"] if row else None
 
     def list(self, session: str | None = None, machine: str | None = None, limit: int = 100) -> list[dict]:
-        sql, args = "SELECT * FROM answers WHERE 1=1", []
+        sql, args = "SELECT * FROM answers WHERE status != 'superseded'", []
         if session:
             sql += " AND session = ?"
             args.append(session)
@@ -121,7 +123,7 @@ class Store:
         return self.get(row_id)
 
     def timing_rows(self, session: str | None = None) -> list[dict]:
-        sql = "SELECT model, timings, input_tokens FROM answers WHERE status IN ('done','no_question') AND timings IS NOT NULL"
+        sql = "SELECT model, timings, input_tokens FROM answers WHERE status IN ('done','no_question','superseded') AND timings IS NOT NULL"
         args: list = []
         if session:
             sql += " AND session = ?"
@@ -129,6 +131,24 @@ class Store:
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
         return [{"model": r["model"], "timings": json.loads(r["timings"]), "input_tokens": r["input_tokens"]} for r in rows]
+
+    def open_coding_problem(self, session: str, machine: str, since_iso: str) -> dict | None:
+        """Latest coding answer from this machine and session that later screenshots can extend."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM answers WHERE session = ? AND machine = ? AND status = 'done' "
+                "AND question_type = 'coding' AND created_at >= ? ORDER BY id DESC LIMIT 1",
+                (session, machine, since_iso),
+            ).fetchone()
+        return _to_dict(row) if row else None
+
+    def supersede(self, ids: list[int], by: int) -> None:
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        with self._lock, self._conn:
+            self._conn.execute(f"UPDATE answers SET status = 'superseded', superseded_by = ? WHERE id IN ({marks})",
+                               (by, *ids))
 
     def captures(self, limit: int) -> list[tuple[int, str]]:
         with self._lock:

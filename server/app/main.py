@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -33,6 +33,10 @@ ALLOWED_MODELS = {m.strip() for m in os.getenv(
 # Second opinion: when the first answer's confidence is below the threshold, ask this model too.
 ESCALATE_MODEL = os.getenv("QUIZBOT_ESCALATE_MODEL", "").strip()
 ESCALATE_BELOW = float(os.getenv("QUIZBOT_ESCALATE_BELOW", "0.8"))
+# Multi-screenshot coding problems: a coding answer stays "open" for this long (from its latest page),
+# and later captures from the same machine and session are sent together with its pages.
+CODING_WINDOW_MIN = float(os.getenv("QUIZBOT_CODING_WINDOW_MIN", "15"))
+CODING_MAX_PAGES = int(os.getenv("QUIZBOT_CODING_MAX_PAGES", "4"))
 STATIC = Path(__file__).parent / "static"
 try:
     LOCAL_TZ = ZoneInfo(os.getenv("TZ") or "Asia/Ho_Chi_Minh")
@@ -103,7 +107,10 @@ def _display_line(r: dict) -> str:
     if r["status"] == "error":
         return f"Error: {r.get('error')}"
     if r.get("question_type") == "coding":
-        return f"{r.get('language') or 'Code'} solution ready — {r.get('answer') or ''} ({r.get('complexity') or ''})".strip()
+        pages = len(r.get("pages") or [])
+        from_pages = f" [from {pages} screenshots]" if pages > 1 else ""
+        return (f"{r.get('language') or 'Code'} solution ready{from_pages} — {r.get('answer') or ''} "
+                f"({r.get('complexity') or ''})").strip()
     keys_list = r.get("answer_keys") or []
     keys = ", ".join(keys_list)
     conf = f"{round((r.get('confidence') or 0) * 100)}%"
@@ -132,6 +139,25 @@ def _answer_fields(result: dict) -> dict:
         code=result.get("code"),
         complexity=result.get("complexity"),
     )
+
+
+def _open_problem_pages(session: str, machine: str) -> tuple[list[int], list[bytes]]:
+    """Ids and images of the coding problem this machine is still working on, oldest first."""
+    if CODING_WINDOW_MIN <= 0 or CODING_MAX_PAGES <= 1:
+        return [], []
+    since = (datetime.now(timezone.utc) - timedelta(minutes=CODING_WINDOW_MIN)).isoformat(timespec="seconds")
+    prev = store.open_coding_problem(session, machine, since)
+    if not prev:
+        return [], []
+    ids = (prev.get("pages") or [prev["id"]])[-(CODING_MAX_PAGES - 1):]
+    images = []
+    for i in ids:
+        path = store.image_path(i)
+        if path and Path(path).exists():
+            images.append(Path(path).read_bytes())
+    if len(images) != len(ids):  # a page's screenshot is missing (cleared?): don't combine
+        return [], []
+    return ids, images
 
 
 def _escalation_settings() -> tuple[str, float]:
@@ -231,9 +257,15 @@ async def capture(
         path.write_bytes(jpeg)
         store.update(row_id, image_path=str(path), image_px=px)
 
+        context_ids, context_images = _open_problem_pages(session, machine.strip() or "unknown")
         t = time.perf_counter()
-        result = await run_in_threadpool(solver.solve, jpeg, "image/jpeg", model)
+        if context_ids:
+            result = await run_in_threadpool(solver.solve, jpeg, "image/jpeg", model, context_images)
+        else:
+            result = await run_in_threadpool(solver.solve, jpeg, "image/jpeg", model)
         timings["model_ms"] = result.get("model_ms") or _ms(t)
+        combined = bool(context_ids) and bool(result.get("same_problem")) and result.get("question_type") == "coding"
+        pages = context_ids + [row_id] if combined else ([row_id] if result.get("question_type") == "coding" else [])
         timings["server_ms"] = _ms(started)
         latency = timings["server_ms"]
         escalate = _needs_escalation(result)
@@ -246,7 +278,13 @@ async def capture(
             input_tokens=result.get("input_tokens"),
             output_tokens=result.get("output_tokens"),
             escalation={"model": escalate[0], "status": "pending", "threshold": escalate[1]} if escalate else None,
+            pages=pages,
         )
+        if combined:
+            # Earlier partial answers are replaced by this one; dashboards drop them from view.
+            store.supersede(context_ids, by=row_id)
+            hub.publish({"type": "superseded", "ids": context_ids, "by": row_id})
+            log.info("#%s combines coding pages %s", row_id, pages)
         log.info("answered #%s in %sms (model %s: %sms) %s/%s%s",
                  row_id, latency, result.get("model"), timings["model_ms"], session, machine,
                  f" -> escalating to {escalate[0]}" if escalate else "")

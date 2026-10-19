@@ -66,6 +66,9 @@
              font: 13.5px/1.55 var(--mono); tab-size: 4; border: 1px solid var(--line); }
   .copy { position: absolute; top: 8px; right: 8px; font-size: 13px; padding: 4px 10px; background: #2b2f3d; color: #fff; border-color: #3a3f52; }
   .copy.done { background: var(--ok); border-color: var(--ok); }
+  .pill.pages { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+  .shots { display: grid; gap: 8px; }
+  .shots figure { margin: 0; } .shots figcaption { font-size: 12px; color: var(--muted); margin-top: 8px; }
   details.code-more summary { cursor: pointer; color: var(--accent); font-size: 13px; margin-top: 6px; }
   details.code-more pre.code { margin-top: 8px; }
   .multi-flag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--warn); border: 1px solid currentColor;
@@ -325,6 +328,21 @@ function heroAnswers(r, correct) {
   return `<div class="hero-answer">${first ? tile(first.shape, correct.map(c => c.key).join(","), true) : ""}<div class="text">${esc(r.answer)}</div></div>`;
 }
 
+function capturesBlock(r) {
+  if (!r.has_image) return "";
+  const pages = (r.pages || []).length > 1 ? r.pages : [r.id];
+  const label = pages.length > 1 ? `Show ${pages.length} captures` : "Show capture";
+  const imgs = pages.map((id, i) => pages.length > 1
+      ? `<figure><figcaption>Screenshot ${i + 1} of ${pages.length}</figcaption><img loading="lazy" alt="Screenshot ${i + 1}" src="/api/answers/${id}/image"></figure>`
+      : `<img loading="lazy" alt="Captured screenshot" src="/api/answers/${id}/image">`).join("");
+  return `<details class="shot"><summary>${label}</summary><div class="shots">${imgs}</div></details>`;
+}
+
+function pagesPill(r) {
+  const n = (r.pages || []).length;
+  return n > 1 ? `<span class="pill pages" title="Combined from ${n} screenshots of the same problem">from ${n} screenshots</span>` : "";
+}
+
 function codeBlock(r) {
   return `<div class="code-wrap"><button class="copy" data-copy="${r.id}" aria-label="Copy code">Copy</button>`
        + `<pre class="code"><code>${esc(r.code)}</code></pre></div>`;
@@ -333,7 +351,7 @@ function codeBlock(r) {
 function codingHero(r) {
   return `<div class="q">${esc(r.question)}</div>
     <div class="code-head">${r.language ? `<span class="pill lang">${esc(r.language)}</span>` : ""}
-      ${r.complexity ? `<span class="pill">${esc(r.complexity)}</span>` : ""}</div>
+      ${r.complexity ? `<span class="pill">${esc(r.complexity)}</span>` : ""}${pagesPill(r)}</div>
     <div class="approach">${esc(r.answer)}</div>
     ${codeBlock(r)}
     ${r.reasoning ? `<div class="why">${esc(r.reasoning)}</div>` : ""}`;
@@ -369,7 +387,7 @@ function renderHero(r) {
   const multi = correct.length > 1 ? `<span class="multi-flag">${correct.length} correct</span>` : "";
   if (!s && r.question_type === "coding" && r.code) {
     $("hero").innerHTML = `${meta(r)}${codingHero(r)}${timingBar(r)}
-      ${r.has_image ? `<details class="shot"><summary>Show capture</summary><img loading="lazy" alt="Captured screenshot" src="/api/answers/${r.id}/image"></details>` : ""}`;
+      ${capturesBlock(r)}`;
     return;
   }
   $("hero").innerHTML = `
@@ -381,13 +399,13 @@ function renderHero(r) {
       ${optionsList(opts, correct)}
       ${r.reasoning ? `<div class="why">${esc(r.reasoning)}</div>` : ""}`}
     ${timingBar(r)}
-    ${r.has_image ? `<details class="shot"><summary>Show capture</summary><img loading="lazy" alt="Captured screenshot" src="/api/answers/${r.id}/image"></details>` : ""}`;
+    ${capturesBlock(r)}`;
 }
 
 function listAnswer(r) {
   if (r.question_type === "coding" && r.code) {
     return `<div class="code-head">${r.language ? `<span class="pill lang">${esc(r.language)}</span>` : ""}
-        ${r.complexity ? `<span class="pill">${esc(r.complexity)}</span>` : ""}<span class="ans">${esc(r.answer)}</span></div>
+        ${r.complexity ? `<span class="pill">${esc(r.complexity)}</span>` : ""}${pagesPill(r)}<span class="ans">${esc(r.answer)}</span></div>
       <details class="code-more"><summary>View code</summary>${codeBlock(r)}</details>`;
   }
   const { correct } = correctAnswers(r);
@@ -405,7 +423,7 @@ function renderList(rows) {
       <div class="q">${esc(r.question || "")}</div>
       ${s ? s : escalationBadge(r) + listAnswer(r)}
       ${timingBar(r)}
-      ${r.has_image ? `<details class="shot"><summary>Show capture</summary><img loading="lazy" alt="Captured screenshot" src="/api/answers/${r.id}/image"></details>` : ""}
+      ${capturesBlock(r)}
     </article>`;
   }).join("") || `<div class="meta">Nothing earlier yet.</div>`;
 }
@@ -535,6 +553,7 @@ function connect() {
     const r = JSON.parse(e.data);
     if (r.type === "cleared") return applyCleared(r.session);
     if (r.type === "settings") return showSettings(r);
+    if (r.type === "superseded") { r.ids.forEach(id => state.rows.delete(id)); render(); return; }
     state.rows.set(r.id, r);
     addOption($("session"), r.session);
     addOption($("machine"), r.machine);

@@ -107,6 +107,19 @@ The agent puts the code on the **clipboard** (`QUIZBOT_COPY_CODE=1`, the default
 it into the editor straight away. The dashboard shows it with a **Copy** button, which also works
 over plain-HTTP LAN addresses.
 
+**Problems longer than one screen.** Capture page by page: statement first, then scroll and capture
+the examples or constraints, then the editor. After a coding answer, the next capture from the same
+machine and session (within `QUIZBOT_CODING_WINDOW_MIN`, default 15 min, counted from the latest
+page) is sent to the model together with the earlier pages, oldest first. The model decides whether
+it is the same problem:
+- **Same problem:** the answer is recomputed from all pages. The earlier partial answer is replaced
+  on the dashboard, which shows *from N screenshots*, and the notification and clipboard get the
+  combined solution. *Show N captures* lists every page.
+- **Different question:** it is answered on its own, and the earlier problem stays as it was.
+
+At most `QUIZBOT_CODING_MAX_PAGES` (default 4) pages are combined; beyond that the oldest are dropped.
+Answers that aren't coding never open a problem, so quizzes are unaffected. Set the window to `0` to turn this off.
+
 Tips:
 - Capture with the full statement and the stub both on screen. If the statement is cut off, the
   answer covers what's visible and reports lower confidence.

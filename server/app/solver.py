@@ -54,6 +54,8 @@ Output rules (the app renders shapes and colours itself, so you only output plai
   yellow=circle, green=square.
 - Option text is the answer text only. Never put the key, shape name, colour, letter or any symbol
   or emoji into `text`, `answer` or `answer_keys` values beyond the bare key.
+- Fill `reasoning` before choosing. `answer_keys` and `answer` must be exactly the option(s) your
+  reasoning concludes are correct; re-check the key against the option text before submitting.
 - `answer` is the text of the correct option; if several are correct, join their texts with " | "
   in on-screen order.
 
@@ -87,6 +89,13 @@ ANSWER_TOOL = {
                     "required": ["key", "text"],
                 },
             },
+            # Reasoning comes BEFORE the answer fields on purpose: the model fills tool inputs in
+            # this order, so it works the question out first and then picks the key(s) it argued for.
+            "reasoning": {
+                "type": "string",
+                "description": "Work it out first, in one to three short sentences: what the question asks, "
+                               "which option(s) are correct and why. The answer fields below must match this.",
+            },
             "answer_keys": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -97,9 +106,9 @@ ANSWER_TOOL = {
                 "description": "The answer as text (option text for choice questions, full answer for open ones).",
             },
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "reasoning": {"type": "string", "description": "One or two sentences on why."},
         },
-        "required": ["found_question", "question_type", "question", "answer", "confidence"],
+        "required": ["found_question", "question_type", "question", "options", "reasoning",
+                     "answer_keys", "answer", "confidence"],
     },
 }
 

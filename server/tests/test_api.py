@@ -242,3 +242,10 @@ def test_no_escalation_when_confident_or_off(monkeypatch, client):
     assert stub.calls == ["claude-haiku-5-5", "claude-haiku-5-5"]
     assert client.get("/api/settings").json()["escalate_model"] == ""
     assert client.put("/api/settings", json={"escalate_below": "2"}, headers=AUTH).status_code == 400
+
+
+def test_schema_asks_for_reasoning_before_answer():
+    from app.solver import ANSWER_TOOL
+    order = list(ANSWER_TOOL["input_schema"]["properties"])
+    assert order.index("reasoning") < order.index("answer_keys") < order.index("answer")
+    assert "reasoning" in ANSWER_TOOL["input_schema"]["required"]

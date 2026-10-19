@@ -54,8 +54,23 @@ def read_env_file(path: Path) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
+        values[key.strip()] = _env_value(value)
     return values
+
+
+def _env_value(raw: str) -> str:
+    """dotenv-style value: quotes keep everything inside; otherwise ` # comment` is dropped."""
+    raw = raw.strip()
+    if raw.startswith("#"):  # KEY=   # comment  -> empty
+        return ""
+    if len(raw) >= 2 and raw[0] in "\"'":
+        end = raw.find(raw[0], 1)
+        if end != -1:
+            return raw[1:end]
+    for i, ch in enumerate(raw):
+        if ch == "#" and i > 0 and raw[i - 1].isspace():
+            return raw[:i].strip()
+    return raw
 
 
 @dataclass(frozen=True)

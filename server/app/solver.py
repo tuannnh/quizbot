@@ -6,10 +6,14 @@ machine-readable JSON regardless of question type.
 from __future__ import annotations
 
 import base64
+import json
+import logging
 import os
 import random
 import re
 import time
+
+log = logging.getLogger("quizbot")
 
 # Kahoot's fixed answer tiles. Shape is the stable identifier; colour is for display.
 KAHOOT_SHAPES = {
@@ -148,6 +152,28 @@ def _normalise(result: dict) -> dict:
     return result
 
 
+AUTO_TOOL_NOTE = (
+    "\n\nAlways reply by calling the submit_answer tool exactly once. Do not answer in plain text."
+)
+
+
+def _is_tool_choice_rejection(exc: Exception) -> bool:
+    """400 from models that don't accept a forced tool_choice (e.g. ones that always think first)."""
+    return getattr(exc, "status_code", None) == 400 and "tool_choice" in str(exc)
+
+
+def _answer_from_text(text: str) -> dict | None:
+    """Last resort when a model answers in text: take the outermost JSON object, if any."""
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and "answer" in data else None
+
+
 class ClaudeSolver:
     def __init__(self) -> None:
         import anthropic  # imported lazily so the fake solver works without it
@@ -158,17 +184,18 @@ class ClaudeSolver:
             default_headers={"anthropic-workspace-id": workspace} if workspace else None,
         )
         self.model = os.getenv("QUIZBOT_MODEL", "claude-sonnet-5-5")
-        self.max_tokens = int(os.getenv("QUIZBOT_MAX_TOKENS", "1024"))
+        # Only a ceiling: models that think before answering need room for it.
+        self.max_tokens = int(os.getenv("QUIZBOT_MAX_TOKENS", "4096"))
+        # Models found to reject a forced tool call; they get tool_choice "auto" from then on.
+        self._no_forced_tool: set[str] = set()
 
-    def solve(self, image: bytes, media_type: str, model: str | None = None) -> dict:
-        model = model or self.model
-        started = time.perf_counter()
-        resp = self.client.messages.create(
+    def _create(self, model: str, image: bytes, media_type: str, forced: bool):
+        return self.client.messages.create(
             model=model,
             max_tokens=self.max_tokens,
-            system=SYSTEM_PROMPT,
+            system=SYSTEM_PROMPT if forced else SYSTEM_PROMPT + AUTO_TOOL_NOTE,
             tools=[ANSWER_TOOL],
-            tool_choice={"type": "tool", "name": "submit_answer"},
+            tool_choice={"type": "tool", "name": "submit_answer"} if forced else {"type": "auto"},
             messages=[
                 {
                     "role": "user",
@@ -186,16 +213,41 @@ class ClaudeSolver:
                 }
             ],
         )
+
+    def solve(self, image: bytes, media_type: str, model: str | None = None) -> dict:
+        model = model or self.model
+        started = time.perf_counter()
+        forced = model not in self._no_forced_tool
+        try:
+            resp = self._create(model, image, media_type, forced)
+        except Exception as exc:
+            if not (forced and _is_tool_choice_rejection(exc)):
+                raise
+            self._no_forced_tool.add(model)
+            log.info("%s rejects forced tool_choice; using auto from now on", model)
+            started = time.perf_counter()  # time the call that actually answered
+            resp = self._create(model, image, media_type, forced=False)
         model_ms = int((time.perf_counter() - started) * 1000)
+
+        result = None
         for block in resp.content:
             if block.type == "tool_use" and block.name == "submit_answer":
                 result = dict(block.input)
-                result["model"] = model
-                result["model_ms"] = model_ms
-                result["input_tokens"] = resp.usage.input_tokens
-                result["output_tokens"] = resp.usage.output_tokens
-                return _normalise(result)
-        raise RuntimeError(f"Model did not return an answer (stop_reason={resp.stop_reason})")
+                break
+        if result is None:
+            text = "".join(getattr(b, "text", "") for b in resp.content if b.type == "text")
+            result = _answer_from_text(text)
+        if result is None:
+            raise RuntimeError(f"{model} did not return an answer (stop_reason={resp.stop_reason})")
+        result.setdefault("found_question", True)
+        result.setdefault("question_type", "other")
+        result.setdefault("question", "")
+        result.setdefault("confidence", 0.5)
+        result["model"] = model
+        result["model_ms"] = model_ms
+        result["input_tokens"] = resp.usage.input_tokens
+        result["output_tokens"] = resp.usage.output_tokens
+        return _normalise(result)
 
 
 class FakeSolver:

@@ -146,3 +146,38 @@ def test_colour_keys_map_to_shapes():
     r = _normalise({"question_type": "multiple_choice", "options": [{"key": "Red", "text": "A"}, {"key": "Blue", "text": "B"}],
                     "answer_keys": ["blue"], "answer": "B"})
     assert r["answer_keys"] == ["diamond"] and r["question_type"] == "kahoot" and r["shape"] == "diamond"
+
+
+def test_falls_back_when_model_rejects_forced_tool(monkeypatch):
+    from types import SimpleNamespace as NS
+    from app.solver import ClaudeSolver
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    solver = ClaudeSolver()
+    calls = []
+
+    class Rejected(Exception):
+        status_code = 400
+
+    def create(**kw):
+        calls.append(kw["tool_choice"]["type"])
+        if kw["tool_choice"]["type"] == "tool":
+            raise Rejected('tool_choice: type "tool" and "any" are not supported for this model.')
+        answer = {"found_question": True, "question_type": "true_false", "question": "lac operon is repressible?",
+                  "options": [{"key": "diamond", "text": "True"}, {"key": "triangle", "text": "False"}],
+                  "answer_keys": ["triangle"], "answer": "False", "confidence": 0.9}
+        return NS(content=[NS(type="thinking"), NS(type="tool_use", name="submit_answer", input=answer)],
+                  stop_reason="tool_use", usage=NS(input_tokens=1200, output_tokens=300))
+
+    monkeypatch.setattr(solver.client.messages, "create", create)
+    r = solver.solve(b"img", "image/jpeg", "claude-opus-5-5")
+    assert r["answer_keys"] == ["triangle"] and r["shape"] == "triangle" and r["question_type"] == "true_false"
+    assert calls == ["tool", "auto"]
+    solver.solve(b"img", "image/jpeg", "claude-opus-5-5")   # remembered: no second rejected call
+    assert calls == ["tool", "auto", "auto"]
+
+
+def test_text_json_answer_is_accepted():
+    from app.solver import _answer_from_text
+    assert _answer_from_text('Sure: {"answer": "False", "answer_keys": ["triangle"]} done')["answer"] == "False"
+    assert _answer_from_text("no json here") is None

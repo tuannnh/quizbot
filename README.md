@@ -94,6 +94,20 @@ Restart the agent only when `agent.py` itself changes (after a `git pull`):
 - Windows: re-run `install_windows.ps1` (it restarts the background process)
 - macOS: `launchctl kickstart -k gui/$(id -u)/me.quizbot.agent`
 
+### Second opinion (fast model first, stronger model when unsure)
+
+**Settings → Double-check with** picks a second model, for example `claude-sonnet-5-5`, and
+**…when confidence is below** sets a threshold (default 80%). If the first answer's confidence is
+under the threshold:
+1. The agent and the notification get the first answer immediately.
+2. The server asks the second model in the background.
+3. The dashboard shows *Double-checking with sonnet…*, then either **✓ sonnet agrees**, or a red
+   **Changed by sonnet** badge with the new answer and the old one struck through. When the tab
+   is in the background, its title starts with ⚠.
+
+Speed stats stay with the first model. The second call's time is shown as *second opinion* in the
+timing legend. Server defaults: `QUIZBOT_ESCALATE_MODEL` (empty = off) and `QUIZBOT_ESCALATE_BELOW` (0.8).
+
 ### Clearing history
 
 **Settings → Clear history** deletes answers and their stored screenshots. If a session is selected
@@ -132,7 +146,10 @@ docker compose exec quizbot python -m app.bench \
   --models claude-haiku-5-5,claude-sonnet-5-5 --edges 1568,1024,768 --n 20 --repeat 2
 ```
 It prints p50/p90/mean latency, input tokens, and how often each variant agreed with the
-first model at the largest size. Agreement is a consistency check, not a measure of correctness.
+first model at the largest size. Add `--diff` to list every question where the variants disagree,
+with the options, each variant's pick, confidence and reasoning, plus a link to the capture.
+This is how to tell which model was actually right, and what confidence threshold to set
+for the second opinion. Agreement is a consistency check, not a measure of correctness.
 Use `--images <folder>` to run on your own screenshots instead.
 
 ## API

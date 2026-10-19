@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
@@ -30,6 +30,9 @@ MAX_EDGE = int(os.getenv("QUIZBOT_MAX_EDGE", "1568"))  # Claude's sweet spot for
 # Models an agent may request per capture (for side-by-side speed comparison).
 ALLOWED_MODELS = {m.strip() for m in os.getenv(
     "QUIZBOT_ALLOWED_MODELS", "claude-haiku-5-5,claude-sonnet-5-5,claude-opus-5-5").split(",") if m.strip()}
+# Second opinion: when the first answer's confidence is below the threshold, ask this model too.
+ESCALATE_MODEL = os.getenv("QUIZBOT_ESCALATE_MODEL", "").strip()
+ESCALATE_BELOW = float(os.getenv("QUIZBOT_ESCALATE_BELOW", "0.8"))
 STATIC = Path(__file__).parent / "static"
 try:
     LOCAL_TZ = ZoneInfo(os.getenv("TZ") or "Asia/Ho_Chi_Minh")
@@ -111,9 +114,84 @@ def _display_line(r: dict) -> str:
     return f"{r['answer']} ({conf})"
 
 
+def _answer_fields(result: dict) -> dict:
+    return dict(
+        question_type=result.get("question_type"),
+        question=result.get("question"),
+        options=result.get("options", []),
+        answer_keys=result.get("answer_keys", []),
+        answer=result.get("answer"),
+        shape=result.get("shape"),
+        color=result.get("color"),
+        confidence=result.get("confidence"),
+        reasoning=result.get("reasoning"),
+        model=result.get("model"),
+    )
+
+
+def _escalation_settings() -> tuple[str, float]:
+    s = store.get_settings()
+    model = s["escalate_model"] if "escalate_model" in s else ESCALATE_MODEL
+    try:
+        below = float(s.get("escalate_below", ESCALATE_BELOW))
+    except ValueError:
+        below = ESCALATE_BELOW
+    return (model if model in ALLOWED_MODELS else ""), below
+
+
+def _needs_escalation(result: dict) -> tuple[str, float] | None:
+    model, below = _escalation_settings()
+    if not model or model == result.get("model") or not result.get("found_question"):
+        return None
+    if (result.get("confidence") or 0) >= below:
+        return None
+    return model, below
+
+
+def _same_answer(a: dict, b: dict) -> bool:
+    ka = sorted(k.lower() for k in a.get("answer_keys") or [])
+    kb = sorted(k.lower() for k in b.get("answer_keys") or [])
+    if ka or kb:
+        return ka == kb
+    norm = lambda t: " ".join(str(t or "").lower().split()).strip(" .")
+    return norm(a.get("answer")) == norm(b.get("answer"))
+
+
+async def _escalate(row_id: int, jpeg: bytes, first: dict, model: str, threshold: float) -> None:
+    """Runs after the first answer is returned: ask the stronger model, keep its answer if it differs."""
+    snapshot = {k: first.get(k) for k in ("model", "answer_keys", "answer", "confidence")}
+    esc = {"model": model, "status": "pending", "threshold": threshold, "first": snapshot}
+    t = time.perf_counter()
+    try:
+        second = await run_in_threadpool(solver.solve, jpeg, "image/jpeg", model)
+    except Exception as exc:
+        log.warning("escalation to %s failed for #%s: %s", model, row_id, exc)
+        esc.update(status="error", error=str(exc)[:300], model_ms=_ms(t))
+        store.update(row_id, escalation=esc)
+        hub.publish(store.get(row_id))
+        return
+    esc["model_ms"] = second.get("model_ms") or _ms(t)
+    esc["confidence"] = second.get("confidence")
+    current = store.get(row_id) or {}
+    timings = {**(current.get("timings") or {}), "escalate_ms": esc["model_ms"]}
+    if second.get("found_question") and not _same_answer(first, second):
+        esc["status"] = "changed"
+        # Swap in the second model's answer, but keep `model`, tokens and timings tied to the
+        # first call so the speed stats stay per model; `escalation` records who changed it.
+        fields = {k: v for k, v in _answer_fields(second).items() if k != "model"}
+        store.update(row_id, **fields, escalation=esc, timings=timings)
+    else:
+        esc["status"] = "agreed"
+        store.update(row_id, escalation=esc, timings=timings)
+    log.info("escalation #%s: %s %s (first %s %.0f%%)", row_id, model, esc["status"],
+             first.get("model"), 100 * (first.get("confidence") or 0))
+    hub.publish(store.get(row_id))
+
+
 # ---------------------------------------------------------------- API
 @app.post("/api/capture")
 async def capture(
+    background: BackgroundTasks,
     image: UploadFile = File(...),
     machine: str = Form("unknown"),
     session: str | None = Form(default=None),  # empty = the session set on the dashboard
@@ -151,26 +229,24 @@ async def capture(
         timings["model_ms"] = result.get("model_ms") or _ms(t)
         timings["server_ms"] = _ms(started)
         latency = timings["server_ms"]
+        escalate = _needs_escalation(result)
         store.update(
             row_id,
             status="done" if result.get("found_question") else "no_question",
-            question_type=result.get("question_type"),
-            question=result.get("question"),
-            options=result.get("options", []),
-            answer_keys=result.get("answer_keys", []),
-            answer=result.get("answer"),
-            shape=result.get("shape"),
-            color=result.get("color"),
-            confidence=result.get("confidence"),
-            reasoning=result.get("reasoning"),
-            model=result.get("model"),
+            **_answer_fields(result),
             latency_ms=latency,
             timings=timings,
             input_tokens=result.get("input_tokens"),
             output_tokens=result.get("output_tokens"),
+            escalation={"model": escalate[0], "status": "pending", "threshold": escalate[1]} if escalate else None,
         )
-        log.info("answered #%s in %sms (model %s: %sms) %s/%s",
-                 row_id, latency, result.get("model"), timings["model_ms"], session, machine)
+        log.info("answered #%s in %sms (model %s: %sms) %s/%s%s",
+                 row_id, latency, result.get("model"), timings["model_ms"], session, machine,
+                 f" -> escalating to {escalate[0]}" if escalate else "")
+        if escalate:
+            # Runs after the response is sent: the agent gets the fast answer now,
+            # the dashboard updates when the second opinion arrives.
+            background.add_task(_escalate, row_id, jpeg, result, *escalate)
     except Exception as exc:  # keep the record so the dashboard shows what failed
         log.exception("solve failed for #%s", row_id)
         timings["server_ms"] = _ms(started)
@@ -237,7 +313,7 @@ def models():
 
 
 # ---------------------------------------------------------------- settings + history
-SETTING_KEYS = ("session", "model")
+SETTING_KEYS = ("session", "model", "escalate_model", "escalate_below")
 
 
 def _settings_view() -> dict:
@@ -247,6 +323,8 @@ def _settings_view() -> dict:
         "model": s.get("model", ""),
         "effective_session": s.get("session") or _today(),
         "effective_model": s.get("model") or getattr(solver, "model", "fake"),
+        "escalate_model": _escalation_settings()[0],
+        "escalate_below": _escalation_settings()[1],
         "allowed_models": sorted(ALLOWED_MODELS),
         "auth_required": bool(TOKEN),
     }
@@ -263,8 +341,18 @@ async def put_settings(request: Request, x_quizbot_token: str | None = Header(de
     _check_token(x_quizbot_token)
     body = await request.json()
     values = {k: (str(body[k]).strip() if body[k] is not None else "") for k in SETTING_KEYS if k in body}
-    if values.get("model") and values["model"] not in ALLOWED_MODELS:
-        raise HTTPException(400, f"model not allowed; choose one of {sorted(ALLOWED_MODELS)}")
+    for key in ("model", "escalate_model"):
+        if values.get(key) and values[key] not in ALLOWED_MODELS:
+            raise HTTPException(400, f"{key} not allowed; choose one of {sorted(ALLOWED_MODELS)}")
+    if "escalate_model" in values and not values["escalate_model"]:
+        values["escalate_model"] = "off"  # stored explicitly so the env default doesn't come back
+    if values.get("escalate_below"):
+        try:
+            below = float(values["escalate_below"])
+        except ValueError:
+            raise HTTPException(400, "escalate_below must be a number between 0 and 1")
+        if not 0 <= below <= 1:
+            raise HTTPException(400, "escalate_below must be between 0 and 1")
     if len(values.get("session", "")) > 80:
         raise HTTPException(400, "session name too long (max 80)")
     store.put_settings(values)

@@ -50,6 +50,12 @@
   .answers { display: grid; gap: 12px; margin: 6px 0 4px; }
   .hero-answer { display: flex; align-items: center; gap: 16px; }
   .hero-answer .text { font-size: clamp(24px, 4.6vw, 40px); font-weight: 700; line-height: 1.12; letter-spacing: -.02em; }
+  .esc { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; border-radius: 999px;
+         padding: 3px 10px; margin: 2px 0 6px; border: 1px solid currentColor; }
+  .esc.pending { color: var(--warn); } .esc.agreed { color: var(--ok); }
+  .esc.changed { color: #fff; background: var(--err); border-color: var(--err); }
+  .esc.error { color: var(--muted); }
+  .esc s { font-weight: 500; opacity: .85; }
   .multi-flag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--warn); border: 1px solid currentColor;
                 border-radius: 999px; padding: 1px 8px; margin-left: 6px; vertical-align: 1px; }
   .tile { flex: none; width: 72px; height: 72px; border-radius: 12px; display: grid; place-items: center; }
@@ -120,6 +126,14 @@
       <label>Model
         <select id="setModel"></select>
         <span class="hint" id="modelHint"></span>
+      </label>
+      <label>Double-check with
+        <select id="setEscModel"></select>
+        <span class="hint">Asks this model too when the first answer is unsure; replaces it if they disagree.</span>
+      </label>
+      <label>…when confidence is below
+        <input id="setEscBelow" type="number" min="0" max="100" step="5" inputmode="numeric">
+        <span class="hint">Percent. 80 is a good start; 100 checks every answer.</span>
       </label>
       <label id="tokenField">Access token
         <input id="token" type="password" autocomplete="off" placeholder="QUIZBOT_TOKEN">
@@ -233,6 +247,7 @@ function timingBar(r) {
     <div class="tlegend"><span style="--c:transparent">total <b>${total}</b> ms${t.end_to_end_ms ? "" : " (server side)"}</span>
       ${parts.map(([k, label, c]) => `<span style="--c:${c}">${label} <b>${t[k]}</b></span>`).join("")}
       ${r.model ? `<span style="--c:transparent">${esc(r.model)}${r.input_tokens ? ` · ${r.input_tokens} tok in` : ""}</span>` : ""}
+      ${t.escalate_ms ? `<span style="--c:transparent">second opinion <b>${t.escalate_ms}</b> ms</span>` : ""}
     </div>`;
 }
 
@@ -269,6 +284,26 @@ function statusLine(r) {
   return null;
 }
 
+const short = (m) => String(m || "").replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2");
+
+function firstAnswerText(first) {
+  const keys = (first.answer_keys || []).join(", ");
+  return keys ? `${keys}${first.answer ? ` (${first.answer})` : ""}` : (first.answer || "");
+}
+
+function escalationBadge(r) {
+  const e = r.escalation;
+  if (!e || r.status !== "done") return "";
+  const m = esc(short(e.model));
+  if (e.status === "pending") return `<div class="esc pending"><span class="spin"></span> Double-checking with ${m}…</div>`;
+  if (e.status === "agreed") return `<div class="esc agreed">✓ ${m} agrees</div>`;
+  if (e.status === "changed") {
+    const was = e.first ? `${esc(short(e.first.model))} said <s>${esc(firstAnswerText(e.first))}</s>` : "";
+    return `<div class="esc changed">Changed by ${m} · ${was}</div>`;
+  }
+  return `<div class="esc error" title="${esc(e.error || "")}">${m} check failed</div>`;
+}
+
 function heroAnswers(r, correct) {
   // One big row per correct option: tile + its text, so multi-select answers are scannable at a glance.
   if (correct.length && correct.some(c => c.text)) {
@@ -290,6 +325,7 @@ function renderHero(r) {
     ${meta(r)}
     ${s ? `<div class="q">${s}</div>` : `
       <div class="q">${esc(r.question)}${multi}</div>
+      ${escalationBadge(r)}
       <div class="answers">${heroAnswers(r, correct)}</div>
       ${optionsList(opts, correct)}
       ${r.reasoning ? `<div class="why">${esc(r.reasoning)}</div>` : ""}`}
@@ -311,7 +347,7 @@ function renderList(rows) {
     return `<article class="card">
       ${meta(r)}
       <div class="q">${esc(r.question || "")}</div>
-      ${s ? s : listAnswer(r)}
+      ${s ? s : escalationBadge(r) + listAnswer(r)}
       ${timingBar(r)}
       ${r.has_image ? `<details class="shot"><summary>Show capture</summary><img loading="lazy" alt="Captured screenshot" src="/api/answers/${r.id}/image"></details>` : ""}
     </article>`;
@@ -358,6 +394,13 @@ function showSettings(s) {
   sel.value = document.activeElement === sel ? current : s.model;
   $("sessionHint").textContent = `Now: ${s.effective_session}${s.session ? "" : " (default)"}`;
   $("modelHint").textContent = `Now: ${s.effective_model}${s.model ? "" : " (server default)"}`;
+  const esc = $("setEscModel");
+  const escCurrent = esc.value;
+  esc.innerHTML = "";
+  esc.add(new Option("Off", ""));
+  s.allowed_models.forEach(m => esc.add(new Option(m, m)));
+  esc.value = document.activeElement === esc ? escCurrent : (s.escalate_model || "");
+  if (document.activeElement !== $("setEscBelow")) $("setEscBelow").value = Math.round((s.escalate_below ?? 0.8) * 100);
   $("tokenField").style.display = s.auth_required ? "" : "none";
 }
 
@@ -371,7 +414,11 @@ async function saveSettings() {
   store.set("quizbot-token", $("token").value.trim());
   const res = await fetch("/api/settings", {
     method: "PUT", headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify({ session: $("setSession").value.trim(), model: $("setModel").value }),
+    body: JSON.stringify({
+      session: $("setSession").value.trim(), model: $("setModel").value,
+      escalate_model: $("setEscModel").value,
+      escalate_below: String(Math.min(100, Math.max(0, Number($("setEscBelow").value) || 0)) / 100),
+    }),
   });
   if (!res.ok) { note.className = "note err"; note.textContent = await apiError(res); return; }
   showSettings(await res.json());
@@ -437,7 +484,9 @@ function connect() {
     addOption($("machine"), r.machine);
     render();
     if (r.status !== "pending") scheduleStats();
-    if (r.status === "done" && document.hidden) document.title = `● ${r.answer} — QuizBot`;
+    if (r.status === "done" && document.hidden) {
+      document.title = `${r.escalation?.status === "changed" ? "⚠ changed: " : "● "}${r.answer} — QuizBot`;
+    }
   };
 }
 

@@ -42,9 +42,13 @@ MIGRATIONS = {
     "input_tokens": "INTEGER",
     "output_tokens": "INTEGER",
     "image_px": "TEXT",         # e.g. "1568x1045" as sent to the model
+    # JSON: second-opinion check {model, status: pending|agreed|changed|error, threshold,
+    #       first: {model, answer_keys, answer, confidence}, confidence, model_ms, error}
+    "escalation": "TEXT",
 }
 
-JSON_COLS = ("options", "answer_keys", "timings")
+JSON_COLS = ("options", "answer_keys", "timings", "escalation")
+JSON_EMPTY = {"options": [], "answer_keys": [], "timings": {}, "escalation": None}
 
 
 class Store:
@@ -174,6 +178,6 @@ class Store:
 def _to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     for col in JSON_COLS:
-        d[col] = json.loads(d[col]) if d.get(col) else ({} if col == "timings" else [])
+        d[col] = json.loads(d[col]) if d.get(col) else JSON_EMPTY[col]
     d["has_image"] = bool(d.pop("image_path", None))
     return d

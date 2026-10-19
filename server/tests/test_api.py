@@ -181,3 +181,64 @@ def test_text_json_answer_is_accepted():
     from app.solver import _answer_from_text
     assert _answer_from_text('Sure: {"answer": "False", "answer_keys": ["triangle"]} done')["answer"] == "False"
     assert _answer_from_text("no json here") is None
+
+
+# ---------------------------------------------------------------- escalation (second opinion)
+class _StubSolver:
+    """Haiku answers 'triangle' with the given confidence; Sonnet answers per `sonnet_keys`."""
+
+    def __init__(self, haiku_conf, sonnet_keys):
+        self.haiku_conf, self.sonnet_keys, self.calls = haiku_conf, sonnet_keys, []
+        self.model = "claude-haiku-5-5"
+
+    def solve(self, image, media_type, model=None):
+        model = model or self.model
+        self.calls.append(model)
+        keys = ["triangle"] if model == "claude-haiku-5-5" else self.sonnet_keys
+        opts = [{"key": "triangle", "text": "False", "shape": "triangle"},
+                {"key": "diamond", "text": "True", "shape": "diamond"}]
+        return {"found_question": True, "question_type": "true_false", "question": "Q?", "options": opts,
+                "answer_keys": keys, "answer": "False" if keys == ["triangle"] else "True",
+                "shape": keys[0], "color": None, "confidence": self.haiku_conf if model == "claude-haiku-5-5" else 0.95,
+                "reasoning": "", "model": model, "model_ms": 10, "input_tokens": 1, "output_tokens": 1}
+
+
+def _with_stub(monkeypatch, client, haiku_conf, sonnet_keys):
+    import app.main as m
+    stub = _StubSolver(haiku_conf, sonnet_keys)
+    monkeypatch.setattr(m, "solver", stub)
+    client.put("/api/settings", json={"model": "", "session": "",
+                                      "escalate_model": "claude-sonnet-5-5", "escalate_below": "0.8"}, headers=AUTH)
+    return stub
+
+
+def test_escalation_changes_answer_when_models_disagree(monkeypatch, client):
+    stub = _with_stub(monkeypatch, client, haiku_conf=0.6, sonnet_keys=["diamond"])
+    first = _capture(client, model="claude-haiku-5-5").json()
+    assert first["answer_keys"] == ["triangle"]            # agent gets the fast answer
+    assert first["escalation"]["status"] == "pending"
+    rec = next(r for r in client.get("/api/answers").json() if r["id"] == first["id"])
+    assert stub.calls == ["claude-haiku-5-5", "claude-sonnet-5-5"]
+    assert rec["answer_keys"] == ["diamond"] and rec["answer"] == "True"
+    assert rec["model"] == "claude-haiku-5-5"   # stats/timings stay with the first call
+    assert rec["escalation"]["status"] == "changed"
+    assert rec["escalation"]["first"]["answer_keys"] == ["triangle"]
+    assert rec["timings"]["escalate_ms"] == 10
+
+
+def test_escalation_agrees_keeps_first_answer(monkeypatch, client):
+    _with_stub(monkeypatch, client, haiku_conf=0.6, sonnet_keys=["triangle"])
+    first = _capture(client, model="claude-haiku-5-5").json()
+    rec = next(r for r in client.get("/api/answers").json() if r["id"] == first["id"])
+    assert rec["escalation"]["status"] == "agreed" and rec["model"] == "claude-haiku-5-5"
+
+
+def test_no_escalation_when_confident_or_off(monkeypatch, client):
+    stub = _with_stub(monkeypatch, client, haiku_conf=0.9, sonnet_keys=["diamond"])
+    assert _capture(client, model="claude-haiku-5-5").json()["escalation"] is None
+    client.put("/api/settings", json={"escalate_model": ""}, headers=AUTH)
+    stub.haiku_conf = 0.1
+    assert _capture(client, model="claude-haiku-5-5").json()["escalation"] is None
+    assert stub.calls == ["claude-haiku-5-5", "claude-haiku-5-5"]
+    assert client.get("/api/settings").json()["escalate_model"] == ""
+    assert client.put("/api/settings", json={"escalate_below": "2"}, headers=AUTH).status_code == 400

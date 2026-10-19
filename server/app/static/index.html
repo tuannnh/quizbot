@@ -139,7 +139,7 @@
     </div>
   </section>
 
-  <section id="hero"><div class="empty">Waiting for a capture. Press Left Shift + ` on a machine running the agent.</div></section>
+  <section id="hero"><div class="empty">Waiting for a capture. Press Ctrl + ` on a machine running the agent.</div></section>
   <h2>Speed by model <span style="text-transform:none;letter-spacing:0">(p50 / p90, ms)</span></h2>
   <section id="speed"><div class="meta">No timed answers yet.</div></section>
   <h2>History</h2>
@@ -280,7 +280,7 @@ function heroAnswers(r, correct) {
 
 function renderHero(r) {
   if (!r) {
-    $("hero").innerHTML = `<div class="empty">Waiting for a capture. Press Left Shift + \` on a machine running the agent.</div>`;
+    $("hero").innerHTML = `<div class="empty">Waiting for a capture. Press Ctrl + \` on a machine running the agent.</div>`;
     return;
   }
   const s = statusLine(r);

@@ -1,6 +1,6 @@
 """QuizBot desktop agent (Windows + macOS).
 
-Press Left Shift + ` : captures the window under the mouse pointer and sends it to the
+Press Ctrl + ` (configurable): captures the window under the mouse pointer and sends it to the
 QuizBot server, which reads the question and posts the answer to the dashboard.
 
 Config comes from `quizbot.env` next to this file (falling back to environment variables).
@@ -11,6 +11,7 @@ The file is re-read on every capture, so edits apply immediately, without a rest
     QUIZBOT_MODEL    model for this machine; empty = the model set on the dashboard
     QUIZBOT_MACHINE  label for this computer (default: hostname)
     QUIZBOT_NOTIFY   1 = show a desktop notification with the answer (default 1)
+    QUIZBOT_HOTKEY   modifiers + `, e.g. ctrl+` (default), alt+`, ctrl+shift+`  (restart to apply)
 """
 from __future__ import annotations
 
@@ -65,6 +66,7 @@ class Config:
     model: str     # "" = let the server pick (dashboard setting, else server default)
     machine: str
     notify: bool
+    hotkey: str    # read at startup only; restart the agent after changing it
 
 
 def load_config() -> Config:
@@ -81,6 +83,7 @@ def load_config() -> Config:
         model=get("QUIZBOT_MODEL").strip(),
         machine=get("QUIZBOT_MACHINE").strip() or socket.gethostname(),
         notify=get("QUIZBOT_NOTIFY", "1") == "1",
+        hotkey=get("QUIZBOT_HOTKEY", "ctrl+`").strip(),
     )
 
 
@@ -281,27 +284,68 @@ def on_trigger() -> None:
         _busy.release()
 
 
-# ---------------------------------------------------------------- hotkey: Left Shift + `
-GRAVE_VK = 192 if IS_WIN else 50  # VK_OEM_3 on Windows, kVK_ANSI_Grave on macOS
-_left_shift_down = False
+# ---------------------------------------------------------------- hotkey (default Ctrl + `)
+# The ` key's virtual key code: VK_OEM_3 on Windows; kVK_ANSI_Grave (50) or the ISO-keyboard
+# key left of 1 (10) on macOS. With Ctrl held the reported char is often a control code, so the
+# key code is what we match on.
+GRAVE_VKS = {192} if IS_WIN else {50, 10}
+DEFAULT_HOTKEY = "ctrl+`"
 
 
-def _is_grave(key) -> bool:
-    return getattr(key, "char", None) in ("`", "~") or getattr(key, "vk", None) == GRAVE_VK
+def _modifier_keys() -> dict[str, set]:
+    K = keyboard.Key
+    names = {
+        "ctrl": ("ctrl", "ctrl_l", "ctrl_r"),
+        "shift": ("shift", "shift_l", "shift_r"),
+        "alt": ("alt", "alt_l", "alt_r", "alt_gr"),
+        "cmd": ("cmd", "cmd_l", "cmd_r"),
+    }
+    return {mod: {getattr(K, n) for n in attrs if hasattr(K, n)} for mod, attrs in names.items()}
 
 
-def on_press(key) -> None:
-    global _left_shift_down
-    if key == keyboard.Key.shift_l:
-        _left_shift_down = True
-    elif _left_shift_down and _is_grave(key):
-        threading.Thread(target=on_trigger, daemon=True).start()
+def parse_hotkey(spec: str) -> frozenset[str]:
+    """'ctrl+`' -> {'ctrl'}. Only the ` key is supported as the final key; modifiers: ctrl, shift, alt, cmd."""
+    parts = [p.strip().lower() for p in spec.replace(" ", "").split("+") if p.strip()]
+    aliases = {"control": "ctrl", "option": "alt", "command": "cmd", "win": "cmd", "super": "cmd"}
+    if not parts or parts[-1] not in ("`", "grave", "backtick"):
+        raise ValueError(f"hotkey must end with ` (got {spec!r})")
+    mods = frozenset(aliases.get(p, p) for p in parts[:-1])
+    unknown = mods - {"ctrl", "shift", "alt", "cmd"}
+    if unknown or not mods:
+        raise ValueError(f"hotkey needs at least one of ctrl/shift/alt/cmd (got {spec!r})")
+    return mods
 
 
-def on_release(key) -> None:
-    global _left_shift_down
-    if key == keyboard.Key.shift_l:
-        _left_shift_down = False
+class Hotkey:
+    """Fires when exactly the configured modifiers are held and ` is pressed."""
+
+    def __init__(self, spec: str) -> None:
+        self.spec = spec
+        self.required = parse_hotkey(spec)
+        self.mod_keys = _modifier_keys()
+        self.held: set[str] = set()
+
+    def _mod_of(self, key) -> str | None:
+        for name, keys in self.mod_keys.items():
+            if any(key == k for k in keys):
+                return name
+        return None
+
+    @staticmethod
+    def _is_grave(key) -> bool:
+        return getattr(key, "vk", None) in GRAVE_VKS or getattr(key, "char", None) in ("`", "~")
+
+    def on_press(self, key) -> None:
+        mod = self._mod_of(key)
+        if mod:
+            self.held.add(mod)
+        elif self.held == self.required and self._is_grave(key):
+            threading.Thread(target=on_trigger, daemon=True).start()
+
+    def on_release(self, key) -> None:
+        mod = self._mod_of(key)
+        if mod:
+            self.held.discard(mod)
 
 
 def main() -> None:
@@ -317,9 +361,14 @@ def main() -> None:
         log.info("server reachable: %s", ok)
     except Exception as exc:
         log.warning("server %s not reachable yet (%s); will retry on each capture", cfg.server, exc)
-    log.info("QuizBot agent ready on %s (session=%s, model=%s). Hotkey: Left Shift + `. Config: %s",
-             cfg.machine, cfg.session or "from dashboard", cfg.model or "from dashboard", ENV_FILE)
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+    try:
+        hotkey = Hotkey(cfg.hotkey)
+    except ValueError as exc:
+        log.error("%s; falling back to %s", exc, DEFAULT_HOTKEY)
+        hotkey = Hotkey(DEFAULT_HOTKEY)
+    log.info("QuizBot agent ready on %s (session=%s, model=%s). Hotkey: %s. Config: %s",
+             cfg.machine, cfg.session or "from dashboard", cfg.model or "from dashboard", hotkey.spec, ENV_FILE)
+    with keyboard.Listener(on_press=hotkey.on_press, on_release=hotkey.on_release) as listener:
         listener.join()
 
 

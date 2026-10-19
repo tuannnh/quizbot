@@ -1,6 +1,6 @@
 # QuizBot
 
-Press **Left Shift + `** on any machine → the window under your mouse pointer is captured →
+Press **Ctrl + `** on any machine → the window under your mouse pointer is captured →
 Claude reads the question and answers it → the answer appears on a live dashboard
 (session, machine, question, answer) and as a desktop notification.
 
@@ -151,8 +151,9 @@ Use `--images <folder>` to run on your own screenshots instead.
 | GET | `/api/events` | Server-Sent Events stream (pending + done records) |
 
 ## Known limits / next steps
-- The `~` keystroke still reaches the focused app (the hotkey isn't swallowed). Can be
-  suppressed per-OS with pynput's `win32_event_filter` / `darwin_intercept` if it gets in the way.
+- The hotkey isn't swallowed: Ctrl + ` still reaches the focused app (in VS Code it toggles the
+  terminal; most other apps ignore it). If that clashes, set `QUIZBOT_HOTKEY` in `quizbot.env`
+  (e.g. ``alt+` ``, ``ctrl+shift+` ``; on Mac also ``cmd+` ``) and restart the agent.
 - Dashboard is open on the LAN (only capture needs the token). Put it behind your reverse proxy
   or add a token check if the network isn't trusted.
 - iPhone Shortcut: next step. It will be "Take Screenshot → Get Contents of URL (POST form to

@@ -44,7 +44,7 @@ $lnk = $ws.CreateShortcut($lnkPath)
 $lnk.TargetPath       = "$venv\Scripts\pythonw.exe"
 $lnk.Arguments        = "`"$here\agent.py`""
 $lnk.WorkingDirectory = $here
-$lnk.Description      = "QuizBot agent (Left Shift + `` to capture)"
+$lnk.Description      = "QuizBot agent (Ctrl + `` to capture)"
 $lnk.Save()
 
 Stop-Agent  # re-running the installer restarts the agent instead of starting a second copy

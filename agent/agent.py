@@ -1,0 +1,298 @@
+"""QuizBot desktop agent (Windows + macOS).
+
+Press Left Shift + ` : captures the window under the mouse pointer and sends it to the
+QuizBot server, which reads the question and posts the answer to the dashboard.
+
+Config is read from environment variables, or from `quizbot.env` next to this file:
+    QUIZBOT_SERVER   http://192.168.1.10:8765
+    QUIZBOT_TOKEN    shared secret (same as server)
+    QUIZBOT_SESSION  label for this quiz/session (default: today's date)
+    QUIZBOT_MACHINE  label for this computer (default: hostname)
+    QUIZBOT_NOTIFY   1 = show a desktop notification with the answer (default 1)
+"""
+from __future__ import annotations
+
+import io
+import logging
+import os
+import platform
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import date
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import mss
+import requests
+from PIL import Image
+from pynput import keyboard
+
+HERE = Path(__file__).resolve().parent
+IS_WIN = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+
+
+# ---------------------------------------------------------------- config
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env_file(HERE / "quizbot.env")
+SERVER = os.getenv("QUIZBOT_SERVER", "http://127.0.0.1:8765").rstrip("/")
+TOKEN = os.getenv("QUIZBOT_TOKEN", "")
+SESSION = os.getenv("QUIZBOT_SESSION") or date.today().isoformat()
+MACHINE = os.getenv("QUIZBOT_MACHINE") or socket.gethostname()
+NOTIFY = os.getenv("QUIZBOT_NOTIFY", "1") == "1"
+MODEL = os.getenv("QUIZBOT_MODEL", "")  # empty = server default; e.g. claude-haiku-5-5 for speed
+HTTP = requests.Session()  # keep-alive: avoids a new TCP handshake per capture
+DEBOUNCE_S = 1.0
+
+log = logging.getLogger("quizbot-agent")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+_file = RotatingFileHandler(HERE / "agent.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+_file.setFormatter(_fmt)
+log.addHandler(_file)
+if sys.stdout and sys.stdout.isatty():
+    _console = logging.StreamHandler()
+    _console.setFormatter(_fmt)
+    log.addHandler(_console)
+
+
+# ---------------------------------------------------------------- window under pointer
+Rect = tuple[int, int, int, int]  # left, top, right, bottom
+
+
+def _win_pointer_window() -> tuple[tuple[int, int], Rect | None]:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+
+    pt = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    hwnd = user32.WindowFromPoint(pt)
+    if not hwnd:
+        return (pt.x, pt.y), None
+    root = user32.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT: top-level window, not a child control
+    rect = wintypes.RECT()
+    # Extended frame bounds exclude the invisible resize border/shadow on Windows 10/11.
+    got = ctypes.windll.dwmapi.DwmGetWindowAttribute(root, 9, ctypes.byref(rect), ctypes.sizeof(rect)) == 0
+    if not got:
+        user32.GetWindowRect(root, ctypes.byref(rect))
+    return (pt.x, pt.y), (rect.left, rect.top, rect.right, rect.bottom)
+
+
+def _mac_pointer_window() -> tuple[tuple[int, int], Rect | None]:
+    import Quartz
+
+    loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+    x, y = int(loc.x), int(loc.y)
+    windows = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+        Quartz.kCGNullWindowID,
+    )
+    for w in windows:  # ordered front to back
+        if w.get("kCGWindowLayer", 0) != 0:  # skip menu bar, dock, overlays
+            continue
+        b = w.get("kCGWindowBounds", {})
+        left, top, width, height = int(b["X"]), int(b["Y"]), int(b["Width"]), int(b["Height"])
+        if width < 80 or height < 80:
+            continue
+        if left <= x < left + width and top <= y < top + height:
+            return (x, y), (left, top, left + width, top + height)
+    return (x, y), None
+
+
+def pointer_window() -> tuple[tuple[int, int], Rect | None]:
+    try:
+        if IS_WIN:
+            return _win_pointer_window()
+        if IS_MAC:
+            return _mac_pointer_window()
+    except Exception:
+        log.exception("could not resolve window under pointer")
+    return (0, 0), None
+
+
+# ---------------------------------------------------------------- capture
+def _monitor_at(sct: mss.base.MSSBase, x: int, y: int) -> Rect:
+    for m in sct.monitors[1:]:
+        if m["left"] <= x < m["left"] + m["width"] and m["top"] <= y < m["top"] + m["height"]:
+            return m["left"], m["top"], m["left"] + m["width"], m["top"] + m["height"]
+    m = sct.monitors[1]
+    return m["left"], m["top"], m["left"] + m["width"], m["top"] + m["height"]
+
+
+def _clip(rect: Rect, bounds: Rect) -> Rect:
+    l, t, r, b = rect
+    L, T, R, B = bounds
+    return max(l, L), max(t, T), min(r, R), min(b, B)
+
+
+def _capture_mac(rect: Rect) -> bytes:
+    # The built-in `screencapture` is more reliable on recent macOS than the deprecated CG image API.
+    l, t, r, b = rect
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        path = f.name
+    try:
+        subprocess.run(["screencapture", "-x", "-t", "png", f"-R{l},{t},{r - l},{b - t}", path],
+                       check=True, timeout=10)
+        return Path(path).read_bytes()
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def capture() -> tuple[bytes, str]:
+    (x, y), win = pointer_window()
+    with mss.mss() as sct:
+        monitor = _monitor_at(sct, x, y)
+        if win and (win[2] - win[0]) > 80 and (win[3] - win[1]) > 80:
+            rect, what = _clip(win, monitor), "window"
+        else:
+            rect, what = monitor, "monitor"
+
+        if IS_MAC:
+            raw = _capture_mac(rect)
+        else:
+            l, t, r, b = rect
+            shot = sct.grab({"left": l, "top": t, "width": r - l, "height": b - t})
+            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            raw = buf.getvalue()
+    return raw, what
+
+
+# ---------------------------------------------------------------- send + notify
+def notify(title: str, message: str) -> None:
+    if not NOTIFY:
+        return
+    try:
+        if IS_MAC:
+            safe = message.replace('"', "'")
+            subprocess.run(["osascript", "-e", f'display notification "{safe}" with title "{title}"'], timeout=5)
+        elif IS_WIN:
+            import winsound
+            winsound.MessageBeep()
+    except Exception:
+        log.debug("notify failed", exc_info=True)
+
+
+def _headers() -> dict:
+    return {"X-QuizBot-Token": TOKEN} if TOKEN else {}
+
+
+def send(image: bytes, capture_ms: int) -> dict:
+    data = {"machine": MACHINE, "session": SESSION, "source": f"desktop-{platform.system().lower()}",
+            "capture_ms": str(capture_ms)}
+    if MODEL:
+        data["model"] = MODEL
+    resp = HTTP.post(f"{SERVER}/api/capture", files={"image": ("capture.png", image, "image/png")},
+                     data=data, headers=_headers(), timeout=90)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def report_roundtrip(row_id: int, roundtrip_ms: int, capture_ms: int) -> None:
+    try:
+        HTTP.post(f"{SERVER}/api/answers/{row_id}/client-timing", headers=_headers(), timeout=10,
+                  json={"roundtrip_ms": roundtrip_ms, "capture_ms": capture_ms})
+    except Exception:
+        log.debug("could not report timing", exc_info=True)
+
+
+_busy = threading.Lock()
+_last = 0.0
+
+
+def on_trigger() -> None:
+    global _last
+    now = time.monotonic()
+    if now - _last < DEBOUNCE_S or not _busy.acquire(blocking=False):
+        return
+    _last = now
+    try:
+        started = time.perf_counter()
+        image, what = capture()
+        capture_ms = int((time.perf_counter() - started) * 1000)
+        log.info("captured %s (%d KB) in %dms, sending to %s", what, len(image) // 1024, capture_ms, SERVER)
+        sent = time.perf_counter()
+        result = send(image, capture_ms)
+        roundtrip_ms = int((time.perf_counter() - sent) * 1000)
+        notify("QuizBot", result.get("display", "done"))  # show the answer before any bookkeeping
+        t = result.get("timings") or {}
+        log.info("answer #%s: %s | total %dms = capture %d + network %d + server %d (prepare %s, model %s, %s)",
+                 result.get("id"), result.get("display"), capture_ms + roundtrip_ms, capture_ms,
+                 max(0, roundtrip_ms - t.get("server_ms", 0)), t.get("server_ms", 0),
+                 t.get("prepare_ms"), t.get("model_ms"), result.get("model"))
+        if result.get("id"):
+            report_roundtrip(result["id"], roundtrip_ms, capture_ms)
+    except Exception as exc:
+        log.exception("capture/send failed")
+        notify("QuizBot error", str(exc)[:120])
+    finally:
+        _busy.release()
+
+
+# ---------------------------------------------------------------- hotkey: Left Shift + `
+GRAVE_VK = 192 if IS_WIN else 50  # VK_OEM_3 on Windows, kVK_ANSI_Grave on macOS
+_left_shift_down = False
+
+
+def _is_grave(key) -> bool:
+    return getattr(key, "char", None) in ("`", "~") or getattr(key, "vk", None) == GRAVE_VK
+
+
+def on_press(key) -> None:
+    global _left_shift_down
+    if key == keyboard.Key.shift_l:
+        _left_shift_down = True
+    elif _left_shift_down and _is_grave(key):
+        threading.Thread(target=on_trigger, daemon=True).start()
+
+
+def on_release(key) -> None:
+    global _left_shift_down
+    if key == keyboard.Key.shift_l:
+        _left_shift_down = False
+
+
+def main() -> None:
+    if IS_WIN:
+        try:  # capture real pixels on high-DPI displays
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+    try:
+        ok = requests.get(f"{SERVER}/healthz", timeout=5).json()
+        log.info("server reachable: %s", ok)
+    except Exception as exc:
+        log.warning("server %s not reachable yet (%s); will retry on each capture", SERVER, exc)
+    log.info("QuizBot agent ready on %s (session=%s). Hotkey: Left Shift + `", MACHINE, SESSION)
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
+
+
+if __name__ == "__main__":
+    if "--once" in sys.argv:  # test capture + send without the hotkey
+        time.sleep(float(os.getenv("QUIZBOT_ONCE_DELAY", "3")))
+        on_trigger()
+    else:
+        main()

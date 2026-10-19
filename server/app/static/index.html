@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuizBot</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1b1b1f; --muted: #6b6b75; --line: #e4e2dc;
+    --accent: #3b5bdb; --ok: #2b8a3e; --warn: #c77700; --err: #c92a2a;
+    --red: #e21b3c; --blue: #1368ce; --yellow: #d89e00; --green: #26890c;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121216; --panel: #1b1b21; --ink: #ececf1; --muted: #9a9aa6; --line: #2c2c35; --accent: #7c92ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+           padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0 8px 0 0; letter-spacing: -.01em; }
+  select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
+           background: var(--bg); color: var(--ink); max-width: 46vw; }
+  .live { margin-left: auto; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+
+  /* Latest answer: big and readable from across the desk */
+  #hero { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 20px; margin-bottom: 20px; }
+  #hero .empty { color: var(--muted); }
+  .hero-answer { display: flex; align-items: center; gap: 16px; }
+  .hero-answer .text { font-size: clamp(26px, 5vw, 44px); font-weight: 700; line-height: 1.1; letter-spacing: -.02em; }
+  .tile { flex: none; width: 72px; height: 72px; border-radius: 12px; display: grid; place-items: center; }
+  .tile svg { width: 44px; height: 44px; fill: #fff; }
+  .key { flex: none; min-width: 72px; height: 72px; padding: 0 12px; border-radius: 12px; display: grid; place-items: center;
+         background: var(--accent); color: #fff; font: 700 34px var(--mono); }
+
+  .meta { font-size: 13px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
+  .meta b { color: var(--ink); font-weight: 600; }
+  .q { margin: 10px 0 8px; font-size: 16px; }
+  .opts { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 6px;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .opts li { display: flex; gap: 8px; align-items: center; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; }
+  .opts li.correct { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); font-weight: 600; }
+  .opts .k { font: 600 13px var(--mono); color: var(--muted); }
+  .opts svg { width: 16px; height: 16px; flex: none; }
+  .conf { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; width: 120px; display: inline-block; vertical-align: middle; }
+  .conf i { display: block; height: 100%; }
+  .why { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .shot { margin-top: 10px; }
+  .shot summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+  .shot img { max-width: 100%; border-radius: 8px; border: 1px solid var(--line); margin-top: 8px; }
+
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; }
+  .row { display: flex; gap: 12px; align-items: center; }
+  .row .ans { font-weight: 650; font-size: 17px; }
+  .mini { width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; flex: none; }
+  .mini svg { width: 18px; height: 18px; fill: #fff; }
+  .mini.key-sm { background: var(--accent); color: #fff; font: 700 15px var(--mono); width: auto; min-width: 32px; padding: 0 6px; }
+  .pending { color: var(--warn); } .error { color: var(--err); }
+  .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent;
+          border-radius: 50%; animation: s .8s linear infinite; vertical-align: -2px; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  /* Timing breakdown */
+  .tbar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--line); margin-top: 10px; max-width: 520px; }
+  .tbar i { display: block; height: 100%; }
+  .tlegend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .tlegend span::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+                          background: var(--c); margin-right: 5px; vertical-align: 0; }
+  .tlegend b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #speed { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 20px; overflow-x: auto; }
+  #speed table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+  #speed th, #speed td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  #speed th:first-child, #speed td:first-child { text-align: left; }
+  #speed th { color: var(--muted); font-weight: 500; }
+  #speed td.best { color: var(--ok); font-weight: 700; }
+  @media (max-width: 520px) { .tile, .key { width: 56px; height: 56px; min-width: 56px; } .key { font-size: 26px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>QuizBot</h1>
+  <select id="session" aria-label="Session"><option value="">All sessions</option></select>
+  <select id="machine" aria-label="Machine"><option value="">All machines</option></select>
+  <span class="live"><span class="dot" id="dot"></span><span id="liveText">connecting</span></span>
+</header>
+<main>
+  <section id="hero"><div class="empty">Waiting for a capture. Press Left Shift + ` on a machine running the agent.</div></section>
+  <h2>Speed by model <span style="text-transform:none;letter-spacing:0">(p50 / p90, ms)</span></h2>
+  <section id="speed"><div class="meta">No timed answers yet.</div></section>
+  <h2>History</h2>
+  <section id="list"></section>
+</main>
+
+<script>
+const COLORS = { triangle: "var(--red)", diamond: "var(--blue)", circle: "var(--yellow)", square: "var(--green)" };
+const SHAPES = {
+  triangle: '<svg viewBox="0 0 24 24"><path d="M12 3 22 21H2z"/></svg>',
+  diamond:  '<svg viewBox="0 0 24 24"><path d="M12 2 22 12 12 22 2 12z"/></svg>',
+  circle:   '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>',
+  square:   '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1"/></svg>',
+};
+const state = { rows: new Map(), session: "", machine: "" };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const time = (iso) => new Date(iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z").toLocaleTimeString();
+const confColor = (c) => c >= .8 ? "var(--ok)" : c >= .5 ? "var(--warn)" : "var(--err)";
+
+function badge(r, big) {
+  if (r.shape) {
+    const cls = big ? "tile" : "mini";
+    const svg = SHAPES[r.shape].replace("<svg", '<svg style="fill:#fff"');
+    return `<div class="${cls}" style="background:${COLORS[r.shape]}" title="${r.shape}">${svg}</div>`;
+  }
+  const keys = (r.answer_keys || []).join(",");
+  if (!keys) return "";
+  return big ? `<div class="key">${esc(keys)}</div>` : `<div class="mini key-sm">${esc(keys)}</div>`;
+}
+
+function meta(r) {
+  const conf = r.confidence ?? 0;
+  return `<div class="meta">
+    <span>${time(r.created_at)}</span><span>session <b>${esc(r.session)}</b></span>
+    <span>machine <b>${esc(r.machine)}</b></span><span>${esc(r.source)}</span>
+    ${r.question_type ? `<span>${esc(r.question_type.replace("_", " "))}</span>` : ""}
+    ${r.status === "done" ? `<span><span class="conf"><i style="width:${conf*100}%;background:${confColor(conf)}"></i></span> ${Math.round(conf*100)}%</span>` : ""}
+    ${r.latency_ms ? `<span>${(r.latency_ms/1000).toFixed(1)}s</span>` : ""}
+  </div>`;
+}
+
+const STAGES = [
+  ["capture_ms", "capture", "#8d8d99"],
+  ["network_ms", "network", "#15aabf"],
+  ["prepare_ms", "resize", "#ae3ec9"],
+  ["model_ms", "model", "var(--accent)"],
+  ["other_ms", "server other", "#f59f00"],
+];
+
+function timingBar(r) {
+  const t = { ...(r.timings || {}) };
+  if (!t.model_ms) return "";
+  t.other_ms = Math.max(0, (t.server_ms || 0) - (t.prepare_ms || 0) - (t.model_ms || 0));
+  const total = t.end_to_end_ms || ((t.capture_ms || 0) + (t.network_ms || 0) + (t.server_ms || 0));
+  const parts = STAGES.filter(([k]) => t[k] > 0);
+  return `<div class="tbar" title="${total} ms total">${parts.map(([k, , c]) =>
+      `<i style="width:${(t[k] / total) * 100}%;background:${c}"></i>`).join("")}</div>
+    <div class="tlegend"><span style="--c:transparent">total <b>${total}</b> ms${t.end_to_end_ms ? "" : " (server side)"}</span>
+      ${parts.map(([k, label, c]) => `<span style="--c:${c}">${label} <b>${t[k]}</b></span>`).join("")}
+      ${r.model ? `<span style="--c:transparent">${esc(r.model)}${r.input_tokens ? ` · ${r.input_tokens} tok in` : ""}</span>` : ""}
+    </div>`;
+}
+
+async function loadStats() {
+  const q = state.session ? `?session=${encodeURIComponent(state.session)}` : "";
+  const rows = await fetch("/api/stats" + q).then(r => r.json()).catch(() => []);
+  if (!rows.length) { $("speed").innerHTML = `<div class="meta">No timed answers yet.</div>`; return; }
+  const cols = [["capture_ms", "capture"], ["network_ms", "network"], ["prepare_ms", "resize"],
+                ["model_ms", "model"], ["server_ms", "server"], ["end_to_end_ms", "end to end"]];
+  const best = {};
+  cols.forEach(([k]) => { const v = rows.map(r => r[k].p50).filter(x => x != null); best[k] = v.length > 1 ? Math.min(...v) : null; });
+  const cell = (s, k) => s.p50 == null ? "<td>–</td>" : `<td class="${s.p50 === best[k] ? "best" : ""}">${s.p50} / ${s.p90}</td>`;
+  $("speed").innerHTML = `<table><thead><tr><th>model</th><th>n</th>${cols.map(([, l]) => `<th>${l}</th>`).join("")}<th>tokens in</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td>${esc(r.model)}</td><td>${r.n}</td>${cols.map(([k]) => cell(r[k], k)).join("")}<td>${r.input_tokens_p50 ?? "–"}</td></tr>`).join("")}</tbody></table>`;
+}
+
+let statsTimer;
+function scheduleStats() { clearTimeout(statsTimer); statsTimer = setTimeout(loadStats, 300); }
+
+function options(r) {
+  if (!r.options?.length) return "";
+  const keys = new Set(r.answer_keys || []);
+  return `<ul class="opts">${r.options.map(o => {
+    const shape = o.shape && SHAPES[o.shape] ? SHAPES[o.shape].replace("<svg", `<svg style="fill:${COLORS[o.shape]}"`) : `<span class="k">${esc(o.key)}</span>`;
+    return `<li class="${keys.has(o.key) ? "correct" : ""}">${shape}<span>${esc(o.text)}</span></li>`;
+  }).join("")}</ul>`;
+}
+
+function statusLine(r) {
+  if (r.status === "pending") return `<span class="pending"><span class="spin"></span> Reading the question…</span>`;
+  if (r.status === "error") return `<span class="error">Error: ${esc(r.error)}</span>`;
+  if (r.status === "no_question") return `<span class="pending">No question found in the capture</span>`;
+  return null;
+}
+
+function renderHero(r) {
+  if (!r) return;
+  const s = statusLine(r);
+  $("hero").innerHTML = `
+    ${meta(r)}
+    ${s ? `<div class="q">${s}</div>` : `
+      <div class="q">${esc(r.question)}</div>
+      <div class="hero-answer">${badge(r, true)}<div class="text">${esc(r.answer)}</div></div>
+      ${options(r)}
+      ${r.reasoning ? `<div class="why">${esc(r.reasoning)}</div>` : ""}`}
+    ${timingBar(r)}
+    ${r.has_image ? `<details class="shot"><summary>Show capture</summary><img loading="lazy" src="/api/answers/${r.id}/image"></details>` : ""}`;
+}
+
+function renderList(rows) {
+  $("list").innerHTML = rows.slice(1).map(r => {
+    const s = statusLine(r);
+    return `<article class="card">
+      ${meta(r)}
+      <div class="q">${esc(r.question || "")}</div>
+      ${s ? s : `<div class="row">${badge(r, false)}<span class="ans">${esc(r.answer)}</span></div>`}
+      ${timingBar(r)}
+      ${r.has_image ? `<details class="shot"><summary>Show capture</summary><img loading="lazy" src="/api/answers/${r.id}/image"></details>` : ""}
+    </article>`;
+  }).join("") || `<div class="meta">Nothing earlier yet.</div>`;
+}
+
+function visible() {
+  return [...state.rows.values()]
+    .filter(r => (!state.session || r.session === state.session) && (!state.machine || r.machine === state.machine))
+    .sort((a, b) => b.id - a.id);
+}
+
+function render() {
+  const rows = visible();
+  if (rows.length) renderHero(rows[0]);
+  renderList(rows);
+}
+
+function addOption(sel, value) {
+  if (!value || [...sel.options].some(o => o.value === value)) return;
+  sel.add(new Option(value, value));
+}
+
+async function load() {
+  const [rows, facets] = await Promise.all([
+    fetch("/api/answers?limit=200").then(r => r.json()),
+    fetch("/api/facets").then(r => r.json()),
+  ]);
+  rows.forEach(r => state.rows.set(r.id, r));
+  facets.sessions.forEach(s => addOption($("session"), s.session));
+  facets.machines.forEach(m => addOption($("machine"), m.machine));
+  render();
+  loadStats();
+}
+
+function connect() {
+  const es = new EventSource("/api/events");
+  es.onopen = () => { $("dot").classList.add("on"); $("liveText").textContent = "live"; };
+  es.onerror = () => { $("dot").classList.remove("on"); $("liveText").textContent = "reconnecting"; };
+  es.onmessage = (e) => {
+    const r = JSON.parse(e.data);
+    state.rows.set(r.id, r);
+    addOption($("session"), r.session);
+    addOption($("machine"), r.machine);
+    render();
+    if (r.status !== "pending") scheduleStats();
+    if (r.status === "done" && document.hidden) document.title = `● ${r.answer} — QuizBot`;
+  };
+}
+
+document.addEventListener("visibilitychange", () => { if (!document.hidden) document.title = "QuizBot"; });
+$("session").onchange = (e) => { state.session = e.target.value; render(); loadStats(); };
+$("machine").onchange = (e) => { state.machine = e.target.value; render(); };
+load().then(connect);
+</script>
+</body>
+</html>

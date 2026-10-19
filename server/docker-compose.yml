@@ -1,0 +1,14 @@
+services:
+  quizbot:
+    # Prebuilt image from GitHub Actions: set QUIZBOT_IMAGE=ghcr.io/<your-github-user>/quizbot:latest
+    # in .env, then `docker compose pull && docker compose up -d`.
+    # Without it, `docker compose up -d --build` builds locally.
+    image: ${QUIZBOT_IMAGE:-quizbot:local}
+    build: .
+    container_name: quizbot
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    env_file: .env
+    volumes:
+      - ./data:/data

@@ -1,0 +1,21 @@
+# Secrets
+.env
+quizbot.env
+
+# Runtime data
+server/data/
+data/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

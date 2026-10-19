@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import os
 import random
+import re
 import time
 
 # Kahoot's fixed answer tiles. Shape is the stable identifier; colour is for display.
@@ -16,6 +17,13 @@ KAHOOT_SHAPES = {
     "diamond": "blue",
     "circle": "yellow",
     "square": "green",
+}
+# Model sometimes names the tile by colour or with a word variant; map all of them to the shape.
+SHAPE_ALIASES = {
+    **{s: s for s in KAHOOT_SHAPES},
+    **{c: s for s, c in KAHOOT_SHAPES.items()},
+    "rhombus": "diamond", "red triangle": "triangle", "blue diamond": "diamond",
+    "yellow circle": "circle", "green square": "square",
 }
 
 SYSTEM_PROMPT = """You are QuizBot. You receive a screenshot of a window that contains a quiz question.
@@ -31,10 +39,19 @@ Your job:
 3. Transcribe the question and every option exactly as shown.
 4. Answer it. Think carefully but be fast: the user is under time pressure.
    - For choice questions, return the key(s) of the correct option(s). Use the key printed on screen
-     (e.g. "B" or "2"); for Kahoot use the shape name as the key.
+     (e.g. "B" or "2").
    - If several options are correct ("select all that apply"), return all of their keys.
    - For open questions, give a concise, correct answer the user could type directly.
 5. Give an honest confidence between 0 and 1.
+
+Output rules (the app renders shapes and colours itself, so you only output plain text):
+- Kahoot keys are exactly one lowercase word: triangle, diamond, circle or square. Use the same word
+  for the option's key and its shape. Tile colour tells you the shape: red=triangle, blue=diamond,
+  yellow=circle, green=square.
+- Option text is the answer text only. Never put the key, shape name, colour, letter or any symbol
+  or emoji into `text`, `answer` or `answer_keys` values beyond the bare key.
+- `answer` is the text of the correct option; if several are correct, join their texts with " | "
+  in on-screen order.
 
 If no question is visible, set found_question to false and leave the rest minimal."""
 
@@ -83,23 +100,51 @@ ANSWER_TOOL = {
 }
 
 
+def _shape_of(value: str | None) -> str | None:
+    return SHAPE_ALIASES.get((value or "").strip().lower())
+
+
 def _normalise(result: dict) -> dict:
-    """Fill defaults and derive the Kahoot shape/colour of the answer."""
+    """Fill defaults and make Kahoot answers consistent: every tile's key is its shape name.
+
+    The dashboard draws tiles from `shape`, so whatever words the model used
+    ("Triangle", "red", "rhombus") end up as one of the four canonical shapes.
+    """
     result.setdefault("options", [])
     result.setdefault("answer_keys", [])
     result.setdefault("reasoning", "")
-    shape = None
+
+    renamed: dict[str, str] = {}
     for opt in result["options"]:
-        if opt.get("key") in result["answer_keys"] and opt.get("shape") in KAHOOT_SHAPES:
-            shape = opt["shape"]
-            break
-    if shape is None:
-        for key in result["answer_keys"]:
-            if key.lower() in KAHOOT_SHAPES:
-                shape = key.lower()
-                break
-    result["shape"] = shape
-    result["color"] = KAHOOT_SHAPES.get(shape) if shape else None
+        shape = _shape_of(opt.get("shape")) or _shape_of(opt.get("key"))
+        opt["shape"] = shape
+        if shape:
+            renamed[str(opt.get("key"))] = shape
+            opt["key"] = shape
+        # Strip a leading shape/colour word the model may have glued onto the text
+        # ("triangle5' poly-A tails", "square introns"), but not real words ("circles of Willis").
+        text = str(opt.get("text", "")).strip()
+        if shape:
+            for word in (shape, KAHOOT_SHAPES[shape]):
+                m = re.match(rf"{word}(?![a-z])[\s:.\-–]*", text, re.IGNORECASE)
+                if m and text[m.end():].strip():
+                    text = text[m.end():].strip()
+                    break
+        opt["text"] = text
+
+    keys = []
+    for key in result["answer_keys"]:
+        key = renamed.get(str(key), _shape_of(key) or str(key))
+        if key not in keys:
+            keys.append(key)
+    result["answer_keys"] = keys
+
+    shapes = [k for k in keys if k in KAHOOT_SHAPES]
+    if shapes and result.get("question_type") not in ("kahoot", "true_false"):
+        result["question_type"] = "kahoot"
+    result["shapes"] = shapes                  # every correct tile, in order
+    result["shape"] = shapes[0] if shapes else None
+    result["color"] = KAHOOT_SHAPES.get(result["shape"]) if result["shape"] else None
     return result
 
 
@@ -160,6 +205,22 @@ class FakeSolver:
         model = model or "fake"
         delay = 0.15 if "haiku" in model else 0.4  # lets the dashboard show a visible difference
         time.sleep(delay + random.random() * 0.1)
+        if os.getenv("QUIZBOT_FAKE_MODE") == "multi" or random.random() < 0.3:
+            # Multi-select with messy model output: capitalised keys and shape words in the text.
+            return _normalise({
+                "found_question": True, "question_type": "kahoot",
+                "question": "Which of these are removed or added during mRNA processing?",
+                "options": [
+                    {"key": "Triangle", "text": "triangle 5' poly-A tails", "shape": "none"},
+                    {"key": "Diamond", "text": "Hox genes"},
+                    {"key": "Circle", "text": "exons"},
+                    {"key": "Square", "text": "square introns"},
+                ],
+                "answer_keys": ["Triangle", "Square"],
+                "answer": "5' poly-A tails | introns", "confidence": 0.82,
+                "reasoning": "Fake multi-select answer.", "model": model, "model_ms": int(delay * 1000),
+                "input_tokens": len(image) // 750, "output_tokens": 140,
+            })
         shape = random.choice(list(KAHOOT_SHAPES))
         return _normalise(
             {

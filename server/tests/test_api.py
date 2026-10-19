@@ -92,3 +92,57 @@ def test_workspace_header(monkeypatch):
 def test_dashboard_served(client):
     r = client.get("/")
     assert r.status_code == 200 and "QuizBot" in r.text
+
+
+# ---------------------------------------------------------------- settings, clearing, Kahoot output
+def test_settings_drive_session_and_model(client):
+    assert client.put("/api/settings", json={"session": "bio-quiz"}).status_code == 401
+    r = client.put("/api/settings", json={"session": "bio-quiz", "model": "claude-haiku-5-5"}, headers=AUTH)
+    assert r.json()["effective_session"] == "bio-quiz"
+    body = _capture_no_session(client)
+    assert body["session"] == "bio-quiz" and body["model"] == "claude-haiku-5-5"
+    # A value sent by the agent still wins over the dashboard setting.
+    assert _capture(client).json()["session"] == "test"
+    assert client.put("/api/settings", json={"model": "gpt-x"}, headers=AUTH).status_code == 400
+    r = client.put("/api/settings", json={"session": "", "model": ""}, headers=AUTH).json()
+    assert r["session"] == "" and r["model"] == ""
+    assert _capture_no_session(client)["session"] == r["effective_session"]  # today's date
+
+
+def _capture_no_session(client):
+    r = client.post("/api/capture", files={"image": ("c.png", _png(), "image/png")},
+                    data={"machine": "ci"}, headers=AUTH)
+    assert r.status_code == 200
+    return r.json()
+
+
+def test_clear_history_one_session_then_all(client):
+    keep = _capture(client, session="keep").json()["id"]
+    gone = _capture(client, session="drop").json()["id"]
+    assert client.delete("/api/answers?session=drop").status_code == 401
+    assert client.delete("/api/answers?session=drop", headers=AUTH).json()["deleted"] == 1
+    assert client.get(f"/api/answers/{gone}/image").status_code == 404
+    assert client.get(f"/api/answers/{keep}/image").status_code == 200
+    assert client.delete("/api/answers", headers=AUTH).json()["deleted"] >= 1
+    assert client.get("/api/answers").json() == []
+
+
+def test_kahoot_multi_select_is_normalised():
+    from app.solver import FakeSolver
+    os.environ["QUIZBOT_FAKE_MODE"] = "multi"
+    try:
+        r = FakeSolver().solve(b"x" * 1000, "image/jpeg")
+    finally:
+        del os.environ["QUIZBOT_FAKE_MODE"]
+    assert r["answer_keys"] == ["triangle", "square"]
+    assert r["shapes"] == ["triangle", "square"]
+    texts = {o["key"]: o["text"] for o in r["options"]}
+    assert texts == {"triangle": "5' poly-A tails", "diamond": "Hox genes", "circle": "exons", "square": "introns"}
+    assert all(o["shape"] == o["key"] for o in r["options"])
+
+
+def test_colour_keys_map_to_shapes():
+    from app.solver import _normalise
+    r = _normalise({"question_type": "multiple_choice", "options": [{"key": "Red", "text": "A"}, {"key": "Blue", "text": "B"}],
+                    "answer_keys": ["blue"], "answer": "B"})
+    assert r["answer_keys"] == ["diamond"] and r["question_type"] == "kahoot" and r["shape"] == "diamond"

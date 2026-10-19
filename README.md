@@ -76,6 +76,30 @@ today's date) and `QUIZBOT_MACHINE` (default hostname).
 Quick test without the hotkey: `.venv/bin/python agent.py --once` (captures 3 s later).
 Logs: `agent/agent.log`.
 
+### Changing session, model and other settings
+
+Use either of these:
+
+1. **The dashboard (all machines at once).** Open **Settings** and set the *Active session* and
+   *Model*. Every agent and the iPhone Shortcut use them, as long as their own
+   `QUIZBOT_SESSION` / `QUIZBOT_MODEL` are empty. Leave the session blank to fall back to today's date.
+   Saving needs the access token (`QUIZBOT_TOKEN`), which the browser remembers.
+2. **`quizbot.env` (one machine).** Values set here override the dashboard for that machine.
+   The agent re-reads the file on every capture, so edits apply on the next hotkey press with no restart.
+   This also covers `QUIZBOT_SERVER`, `QUIZBOT_TOKEN`, `QUIZBOT_MACHINE` and `QUIZBOT_NOTIFY`.
+
+Precedence for each capture: agent's `quizbot.env` → dashboard setting → default.
+
+Restart the agent only when `agent.py` itself changes (after a `git pull`):
+- Windows: re-run `install_windows.ps1` (it restarts the background process)
+- macOS: `launchctl kickstart -k gui/$(id -u)/me.quizbot.agent`
+
+### Clearing history
+
+**Settings → Clear history** deletes answers and their stored screenshots. If a session is selected
+in the filter, only that session is deleted; otherwise everything is. Needs the access token.
+API: `DELETE /api/answers?session=<name>` (omit `session` for all).
+
 ### How capture works
 - Windows: `WindowFromPoint` → top-level window → DWM frame bounds (no shadow), DPI-aware.
 - macOS: topmost normal window (layer 0) containing the cursor via Quartz, captured with `screencapture`.
@@ -121,6 +145,8 @@ Use `--images <folder>` to run on your own screenshots instead.
 | POST | `/api/answers/{id}/client-timing` | agent reports `roundtrip_ms` / `capture_ms` |
 | GET | `/api/stats?session=` | p50/p90 per model for each stage |
 | GET | `/api/models` | default and allowed models |
+| GET / PUT | `/api/settings` | active session and model used when an agent sends none (PUT needs token) |
+| DELETE | `/api/answers?session=` | clear one session, or all history (needs token) |
 | GET | `/api/facets` | sessions and machines with counts |
 | GET | `/api/events` | Server-Sent Events stream (pending + done records) |
 

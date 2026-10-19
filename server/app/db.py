@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS answers (
     error         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_answers_session ON answers(session, id);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 # Columns added after v0.1; created on startup if an older database is opened.
@@ -126,6 +130,32 @@ class Store:
                 (limit,),
             ).fetchall()
         return [(r["id"], r["image_path"]) for r in rows]
+
+    def get_settings(self) -> dict[str, str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def put_settings(self, values: dict[str, str | None]) -> dict[str, str]:
+        """Set keys; an empty or None value removes the key (falls back to the default)."""
+        with self._lock, self._conn:
+            for key, value in values.items():
+                if value:
+                    self._conn.execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+                else:
+                    self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        return self.get_settings()
+
+    def delete_answers(self, session: str | None = None) -> list[str]:
+        """Delete answers (all, or one session). Returns image paths so the caller can remove files."""
+        where, args = ("WHERE session = ?", [session]) if session else ("", [])
+        with self._lock, self._conn:
+            paths = [r["image_path"] for r in self._conn.execute(
+                f"SELECT image_path FROM answers {where}", args) if r["image_path"]]
+            self._conn.execute(f"DELETE FROM answers {where}", args)
+        return paths
 
     def facets(self) -> dict:
         with self._lock:

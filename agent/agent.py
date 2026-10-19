@@ -3,10 +3,12 @@
 Press Left Shift + ` : captures the window under the mouse pointer and sends it to the
 QuizBot server, which reads the question and posts the answer to the dashboard.
 
-Config is read from environment variables, or from `quizbot.env` next to this file:
-    QUIZBOT_SERVER   http://192.168.1.10:8765
+Config comes from `quizbot.env` next to this file (falling back to environment variables).
+The file is re-read on every capture, so edits apply immediately, without a restart:
+    QUIZBOT_SERVER   http://10.1.1.99:11138
     QUIZBOT_TOKEN    shared secret (same as server)
-    QUIZBOT_SESSION  label for this quiz/session (default: today's date)
+    QUIZBOT_SESSION  label for this quiz; empty = the session set on the dashboard
+    QUIZBOT_MODEL    model for this machine; empty = the model set on the dashboard
     QUIZBOT_MACHINE  label for this computer (default: hostname)
     QUIZBOT_NOTIFY   1 = show a desktop notification with the answer (default 1)
 """
@@ -22,7 +24,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import date
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -37,24 +39,51 @@ IS_MAC = platform.system() == "Darwin"
 
 
 # ---------------------------------------------------------------- config
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
+ENV_FILE = HERE / "quizbot.env"
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return values
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
-load_env_file(HERE / "quizbot.env")
-SERVER = os.getenv("QUIZBOT_SERVER", "http://127.0.0.1:8765").rstrip("/")
-TOKEN = os.getenv("QUIZBOT_TOKEN", "")
-SESSION = os.getenv("QUIZBOT_SESSION") or date.today().isoformat()
-MACHINE = os.getenv("QUIZBOT_MACHINE") or socket.gethostname()
-NOTIFY = os.getenv("QUIZBOT_NOTIFY", "1") == "1"
-MODEL = os.getenv("QUIZBOT_MODEL", "")  # empty = server default; e.g. claude-haiku-5-5 for speed
+@dataclass(frozen=True)
+class Config:
+    server: str
+    token: str
+    session: str   # "" = let the server pick (dashboard setting, else today's date)
+    model: str     # "" = let the server pick (dashboard setting, else server default)
+    machine: str
+    notify: bool
+
+
+def load_config() -> Config:
+    """quizbot.env wins over process environment; re-read on every capture."""
+    file = read_env_file(ENV_FILE)
+
+    def get(key: str, default: str = "") -> str:
+        return (file.get(key) if key in file else os.getenv(key, default)) or default
+
+    return Config(
+        server=get("QUIZBOT_SERVER", "http://127.0.0.1:8765").rstrip("/"),
+        token=get("QUIZBOT_TOKEN"),
+        session=get("QUIZBOT_SESSION").strip(),
+        model=get("QUIZBOT_MODEL").strip(),
+        machine=get("QUIZBOT_MACHINE").strip() or socket.gethostname(),
+        notify=get("QUIZBOT_NOTIFY", "1") == "1",
+    )
+
+
 HTTP = requests.Session()  # keep-alive: avoids a new TCP handshake per capture
 DEBOUNCE_S = 1.0
 
@@ -180,8 +209,8 @@ def capture() -> tuple[bytes, str]:
 
 
 # ---------------------------------------------------------------- send + notify
-def notify(title: str, message: str) -> None:
-    if not NOTIFY:
+def notify(cfg: Config, title: str, message: str) -> None:
+    if not cfg.notify:
         return
     try:
         if IS_MAC:
@@ -194,24 +223,25 @@ def notify(title: str, message: str) -> None:
         log.debug("notify failed", exc_info=True)
 
 
-def _headers() -> dict:
-    return {"X-QuizBot-Token": TOKEN} if TOKEN else {}
+def _headers(cfg: Config) -> dict:
+    return {"X-QuizBot-Token": cfg.token} if cfg.token else {}
 
 
-def send(image: bytes, capture_ms: int) -> dict:
-    data = {"machine": MACHINE, "session": SESSION, "source": f"desktop-{platform.system().lower()}",
-            "capture_ms": str(capture_ms)}
-    if MODEL:
-        data["model"] = MODEL
-    resp = HTTP.post(f"{SERVER}/api/capture", files={"image": ("capture.png", image, "image/png")},
-                     data=data, headers=_headers(), timeout=90)
+def send(cfg: Config, image: bytes, capture_ms: int) -> dict:
+    data = {"machine": cfg.machine, "source": f"desktop-{platform.system().lower()}", "capture_ms": str(capture_ms)}
+    if cfg.session:  # otherwise the server uses the dashboard's active session
+        data["session"] = cfg.session
+    if cfg.model:    # otherwise the server uses the dashboard's model
+        data["model"] = cfg.model
+    resp = HTTP.post(f"{cfg.server}/api/capture", files={"image": ("capture.png", image, "image/png")},
+                     data=data, headers=_headers(cfg), timeout=90)
     resp.raise_for_status()
     return resp.json()
 
 
-def report_roundtrip(row_id: int, roundtrip_ms: int, capture_ms: int) -> None:
+def report_roundtrip(cfg: Config, row_id: int, roundtrip_ms: int, capture_ms: int) -> None:
     try:
-        HTTP.post(f"{SERVER}/api/answers/{row_id}/client-timing", headers=_headers(), timeout=10,
+        HTTP.post(f"{cfg.server}/api/answers/{row_id}/client-timing", headers=_headers(cfg), timeout=10,
                   json={"roundtrip_ms": roundtrip_ms, "capture_ms": capture_ms})
     except Exception:
         log.debug("could not report timing", exc_info=True)
@@ -227,25 +257,26 @@ def on_trigger() -> None:
     if now - _last < DEBOUNCE_S or not _busy.acquire(blocking=False):
         return
     _last = now
+    cfg = load_config()  # picks up quizbot.env edits without a restart
     try:
         started = time.perf_counter()
         image, what = capture()
         capture_ms = int((time.perf_counter() - started) * 1000)
-        log.info("captured %s (%d KB) in %dms, sending to %s", what, len(image) // 1024, capture_ms, SERVER)
+        log.info("captured %s (%d KB) in %dms, sending to %s", what, len(image) // 1024, capture_ms, cfg.server)
         sent = time.perf_counter()
-        result = send(image, capture_ms)
+        result = send(cfg, image, capture_ms)
         roundtrip_ms = int((time.perf_counter() - sent) * 1000)
-        notify("QuizBot", result.get("display", "done"))  # show the answer before any bookkeeping
+        notify(cfg, "QuizBot", result.get("display", "done"))  # show the answer before any bookkeeping
         t = result.get("timings") or {}
-        log.info("answer #%s: %s | total %dms = capture %d + network %d + server %d (prepare %s, model %s, %s)",
-                 result.get("id"), result.get("display"), capture_ms + roundtrip_ms, capture_ms,
-                 max(0, roundtrip_ms - t.get("server_ms", 0)), t.get("server_ms", 0),
-                 t.get("prepare_ms"), t.get("model_ms"), result.get("model"))
+        log.info("answer #%s [%s, %s]: %s | total %dms = capture %d + network %d + server %d (prepare %s, model %s)",
+                 result.get("id"), result.get("session"), result.get("model"), result.get("display"),
+                 capture_ms + roundtrip_ms, capture_ms, max(0, roundtrip_ms - t.get("server_ms", 0)),
+                 t.get("server_ms", 0), t.get("prepare_ms"), t.get("model_ms"))
         if result.get("id"):
-            report_roundtrip(result["id"], roundtrip_ms, capture_ms)
+            report_roundtrip(cfg, result["id"], roundtrip_ms, capture_ms)
     except Exception as exc:
         log.exception("capture/send failed")
-        notify("QuizBot error", str(exc)[:120])
+        notify(cfg, "QuizBot error", str(exc)[:120])
     finally:
         _busy.release()
 
@@ -280,12 +311,14 @@ def main() -> None:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             pass
+    cfg = load_config()
     try:
-        ok = requests.get(f"{SERVER}/healthz", timeout=5).json()
+        ok = requests.get(f"{cfg.server}/healthz", timeout=5).json()
         log.info("server reachable: %s", ok)
     except Exception as exc:
-        log.warning("server %s not reachable yet (%s); will retry on each capture", SERVER, exc)
-    log.info("QuizBot agent ready on %s (session=%s). Hotkey: Left Shift + `", MACHINE, SESSION)
+        log.warning("server %s not reachable yet (%s); will retry on each capture", cfg.server, exc)
+    log.info("QuizBot agent ready on %s (session=%s, model=%s). Hotkey: Left Shift + `. Config: %s",
+             cfg.machine, cfg.session or "from dashboard", cfg.model or "from dashboard", ENV_FILE)
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
 

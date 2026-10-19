@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -29,6 +31,10 @@ MAX_EDGE = int(os.getenv("QUIZBOT_MAX_EDGE", "1568"))  # Claude's sweet spot for
 ALLOWED_MODELS = {m.strip() for m in os.getenv(
     "QUIZBOT_ALLOWED_MODELS", "claude-haiku-5-5,claude-sonnet-5-5,claude-opus-5-5").split(",") if m.strip()}
 STATIC = Path(__file__).parent / "static"
+try:
+    LOCAL_TZ = ZoneInfo(os.getenv("TZ") or "Asia/Ho_Chi_Minh")
+except Exception:  # unknown TZ string or no tzdata in the image
+    LOCAL_TZ = None
 
 app = FastAPI(title="QuizBot")
 store = Store(DATA_DIR / "quizbot.db")
@@ -64,6 +70,18 @@ def prepare_image(raw: bytes, max_edge: int = MAX_EDGE) -> tuple[bytes, str]:
     return buf.getvalue(), f"{img.width}x{img.height}"
 
 
+def _today() -> str:
+    return datetime.now(LOCAL_TZ).date().isoformat()
+
+
+def _resolve(session: str | None, model: str | None) -> tuple[str, str | None]:
+    """Precedence: value sent by the agent > dashboard setting > default (today's date / server model)."""
+    settings = store.get_settings()
+    session = (session or "").strip() or settings.get("session") or _today()
+    model = (model or "").strip() or settings.get("model") or None
+    return session, model
+
+
 def _ms(since: float) -> int:
     return int((time.perf_counter() - since) * 1000)
 
@@ -81,11 +99,13 @@ def _display_line(r: dict) -> str:
         return "No question found on screen"
     if r["status"] == "error":
         return f"Error: {r.get('error')}"
-    shape = r.get("shape")
-    keys = ", ".join(r.get("answer_keys") or [])
+    keys_list = r.get("answer_keys") or []
+    keys = ", ".join(keys_list)
     conf = f"{round((r.get('confidence') or 0) * 100)}%"
-    if shape:
-        return f"{KAHOOT_SHAPES[shape].upper()} {shape} — {r['answer']} ({conf})"
+    shapes = [k for k in keys_list if k in KAHOOT_SHAPES]
+    if shapes:
+        tiles = " + ".join(f"{KAHOOT_SHAPES[s].upper()} {s}" for s in shapes)
+        return f"{tiles} — {r['answer']} ({conf})"
     if keys:
         return f"{keys} — {r['answer']} ({conf})"
     return f"{r['answer']} ({conf})"
@@ -96,15 +116,16 @@ def _display_line(r: dict) -> str:
 async def capture(
     image: UploadFile = File(...),
     machine: str = Form("unknown"),
-    session: str = Form("default"),
+    session: str | None = Form(default=None),  # empty = the session set on the dashboard
     source: str = Form("desktop"),
     x_quizbot_token: str | None = Header(default=None),
     token: str | None = Form(default=None),  # iPhone Shortcuts find form fields easier than headers
-    model: str | None = Form(default=None),
+    model: str | None = Form(default=None),    # empty = the model set on the dashboard
     capture_ms: int | None = Form(default=None),  # measured by the agent before upload
 ):
     started = time.perf_counter()
     _check_token(x_quizbot_token or token)
+    session, model = _resolve(session, model)
     if model and model not in ALLOWED_MODELS:
         raise HTTPException(400, f"model not allowed; choose one of {sorted(ALLOWED_MODELS)}")
     raw = await image.read()
@@ -114,7 +135,7 @@ async def capture(
     if capture_ms is not None:
         timings["capture_ms"] = capture_ms
 
-    row_id = store.create_pending(session=session.strip() or "default", machine=machine.strip() or "unknown", source=source)
+    row_id = store.create_pending(session=session, machine=machine.strip() or "unknown", source=source)
     hub.publish(store.get(row_id))
 
     try:
@@ -213,6 +234,60 @@ def stats(session: str | None = None):
 @app.get("/api/models")
 def models():
     return {"default": getattr(solver, "model", "fake"), "allowed": sorted(ALLOWED_MODELS)}
+
+
+# ---------------------------------------------------------------- settings + history
+SETTING_KEYS = ("session", "model")
+
+
+def _settings_view() -> dict:
+    s = store.get_settings()
+    return {
+        "session": s.get("session", ""),
+        "model": s.get("model", ""),
+        "effective_session": s.get("session") or _today(),
+        "effective_model": s.get("model") or getattr(solver, "model", "fake"),
+        "allowed_models": sorted(ALLOWED_MODELS),
+        "auth_required": bool(TOKEN),
+    }
+
+
+@app.get("/api/settings")
+def get_settings():
+    return _settings_view()
+
+
+@app.put("/api/settings")
+async def put_settings(request: Request, x_quizbot_token: str | None = Header(default=None)):
+    """Dashboard-controlled defaults for agents that don't set QUIZBOT_SESSION / QUIZBOT_MODEL."""
+    _check_token(x_quizbot_token)
+    body = await request.json()
+    values = {k: (str(body[k]).strip() if body[k] is not None else "") for k in SETTING_KEYS if k in body}
+    if values.get("model") and values["model"] not in ALLOWED_MODELS:
+        raise HTTPException(400, f"model not allowed; choose one of {sorted(ALLOWED_MODELS)}")
+    if len(values.get("session", "")) > 80:
+        raise HTTPException(400, "session name too long (max 80)")
+    store.put_settings(values)
+    view = _settings_view()
+    hub.publish({"type": "settings", **view})
+    return view
+
+
+@app.delete("/api/answers")
+def clear_answers(session: str | None = None, x_quizbot_token: str | None = Header(default=None)):
+    """Delete history and stored captures: one session, or everything when no session is given."""
+    _check_token(x_quizbot_token)
+    paths = store.delete_answers(session or None)
+    removed = 0
+    for p in paths:
+        try:
+            Path(p).unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            log.warning("could not delete %s", p)
+    log.info("cleared %d answers (%s), %d images removed", len(paths), session or "all sessions", removed)
+    hub.publish({"type": "cleared", "session": session or None})
+    return {"deleted": len(paths), "session": session or None}
 
 
 @app.get("/api/facets")

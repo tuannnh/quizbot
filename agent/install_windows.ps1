@@ -8,10 +8,14 @@ $venv    = Join-Path $here ".venv"
 $startup = [Environment]::GetFolderPath("Startup")
 $lnkPath = Join-Path $startup "QuizBot Agent.lnk"
 
-if ($Uninstall) {
+function Stop-Agent {
     Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
-        Where-Object { $_.CommandLine -like "*quizbot*agent.py*" -or $_.CommandLine -like "*$here*agent.py*" } |
+        Where-Object { $_.CommandLine -like "*$here*agent.py*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+}
+
+if ($Uninstall) {
+    Stop-Agent
     Remove-Item $lnkPath -ErrorAction SilentlyContinue
     Write-Host "QuizBot agent removed from startup."
     exit 0
@@ -43,6 +47,7 @@ $lnk.WorkingDirectory = $here
 $lnk.Description      = "QuizBot agent (Left Shift + `` to capture)"
 $lnk.Save()
 
+Stop-Agent  # re-running the installer restarts the agent instead of starting a second copy
 Start-Process -FilePath "$venv\Scripts\pythonw.exe" -ArgumentList "`"$here\agent.py`"" -WorkingDirectory $here
 Write-Host "QuizBot agent installed and running. It starts automatically at login."
 Write-Host "Log file: $here\agent.log"

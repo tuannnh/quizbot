@@ -107,7 +107,11 @@ class ClaudeSolver:
     def __init__(self) -> None:
         import anthropic  # imported lazily so the fake solver works without it
 
-        self.client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+        # Keys that aren't scoped to a workspace must name one on every request.
+        workspace = os.getenv("ANTHROPIC_WORKSPACE_ID", "").strip()
+        self.client = anthropic.Anthropic(  # reads ANTHROPIC_API_KEY
+            default_headers={"anthropic-workspace-id": workspace} if workspace else None,
+        )
         self.model = os.getenv("QUIZBOT_MODEL", "claude-sonnet-5-5")
         self.max_tokens = int(os.getenv("QUIZBOT_MAX_TOKENS", "1024"))
 

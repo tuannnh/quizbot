@@ -79,6 +79,16 @@ def test_client_timing_and_stats(client):
     assert "claude-sonnet-5-5" in models
 
 
+def test_workspace_header(monkeypatch):
+    from app.solver import ClaudeSolver
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_123")
+    assert ClaudeSolver().client.default_headers["anthropic-workspace-id"] == "wrkspc_123"
+    monkeypatch.delenv("ANTHROPIC_WORKSPACE_ID")
+    assert "anthropic-workspace-id" not in ClaudeSolver().client.default_headers
+
+
 def test_dashboard_served(client):
     r = client.get("/")
     assert r.status_code == 200 and "QuizBot" in r.text
